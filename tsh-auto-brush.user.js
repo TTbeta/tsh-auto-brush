@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         TSH自动刷课
-// @version      2.3.1-local73
+// @version      2.3.1-local78
 // @namespace    wasd258-jpg.tsh-autobrush
 // @description  清华社英语在线自动刷课（双引擎版）。自动识别站点版本：新版 /course_center/ 与旧站 /legacy/ 均支持，装一次即可。功能：自动答题+章节推进+查成绩+学习时长保活。新版支持单选/多选/判断/填空/下拉/拖拽；语音题需真人录音。含结构自检。
 // @author       WASD258-jpg
@@ -44,7 +44,7 @@ function __TSH_NEW_ENGINE__() {
 
     'use strict';
 
-    const SCRIPT_VERSION = '2.3.1-local73'; // 与 @version 保持一致
+    const SCRIPT_VERSION = '2.3.1-local78'; // 与 @version 保持一致
 
     // ============================================================================
     // 1. 新站契约常量（逆向自线上产物，构建版本 20260930165203）
@@ -640,7 +640,7 @@ function __TSH_NEW_ENGINE__() {
 
     // 可作答控件：任意一种命中，说明这张卡能靠填 DOM 完成，不应按语音题跳过。
     //
-    // 【本地修复 v2.3.1-local73】判据最终收敛为两条：
+    // 【本地修复 v2.3.1-local78】判据最终收敛为两条：
     //   v2.3.0   卡片深处出现语音类名就判语音题（后代查询 → 误判填空题）
     //   local1   加"可填控件优先"+"标记须在自身包装层"，仍漏：听力填空题的
     //            空位是基础类 fill-blank / antd 下拉，未聚焦时不含 -do 与 contenteditable
@@ -665,11 +665,13 @@ function __TSH_NEW_ENGINE__() {
     // 只有这些才说明题目要求真人发声：录音按钮、口语图、头像播报、角色扮演容器
     // 【local40】[class*="record"] 会命中答题容器 do-record / do-record-answer，
     // 把每张问答题卡都判成"有录音控件"→ 整节当语音题跳过。改成精确的录音控件。
+    // 【local74】[class*="record-start"] / [class*="record-play"] 会命中**听力播放条**的
+    // 播放按钮（class 形如 record-play / record-start），导致「有录音条的填空题」被判语音题跳过。
+    // 只保留真正代表"麦克风/录音设备"的选择器；播放条再怎么放音也不需要真人发声。
     const RECORDING_SELECTOR = [
-        'img[title="录音"]', '.lib-oral-img',
+        'img[title*="录音"]', '.lib-oral-img',
         '[class*="record-btn"]', '[class*="recordBtn"]', '[class*="recorder"]',
-        '[class*="record-icon"]', '[class*="record-start"]', '[class*="record-play"]',
-        '[class*="mouth"]',
+        '[class*="oral-record"]', '[class*="mic-icon"]', '[class*="microphone"]',
         '.avatar-view-container', '.role-play-course-container',
         '.oral-brief-course-do', '.oral-brief-course-done'
     ].join(', ');
@@ -695,10 +697,25 @@ function __TSH_NEW_ENGINE__() {
 
     // 被跳过时打印判定依据，用于区分「真语音题」与「误判」
     function speechDiagnosis(el) {
+        let rec = null;
+        try {
+            const hit = $1(RECORDING_SELECTOR, el);
+            if (hit) {
+                rec = {
+                    tag: hit.tagName,
+                    cls: String(hit.className || '').slice(0, 40),
+                    title: String(hit.getAttribute && hit.getAttribute('title') || '').slice(0, 12)
+                };
+            }
+        } catch (e) {}
         return {
             type: detectType(el),
             hasAnswerable: hasAnswerableControl(el),
             hasRecControl: hasRecordingAffordance(el),
+            recHit: rec,
+            blanks: el ? el.querySelectorAll('[class*="fill-blank"]').length : 0,
+            radios: el ? el.querySelectorAll('.ant-radio-wrapper, .ant-checkbox-wrapper').length : 0,
+            areas: el ? el.querySelectorAll('textarea').length : 0,
             cardClass: el && el.className ? String(el.className).slice(0, 90) : '',
             markers: $(SPEECH_MARKER_SELECTOR, el).map(n => String(n.className).slice(0, 40)).slice(0, 3)
         };
@@ -2703,10 +2720,20 @@ function __TSH_NEW_ENGINE__() {
             if (!isVisibleEl(btn)) log('提交按钮不可见，尝试滚动后点击', { cls: String(btn.className || '').slice(0, 40) });
             realClick(btn, 'submit');
             log('已点击页面提交按钮', { cls: String(btn.className || '').slice(0, 30) });
-            await sleep(rnd(1200, 1800));
-            return true;
+            await sleep(rnd(1400, 2000));
+            // 【local76】点完必须验收：实测某些页面点击落点正确但站点毫无反应
+            // （st 不变、按钮还在、仍停在作答态）。这时直接 return true 会白白少一次提交。
+            const stillWritable = !!firstEditableControl();
+            const btnAlive = !!(btn && document.contains(btn) && isShownEl(btn));
+            log('页面提交验收', { stillWritable: stillWritable, btnAlive: btnAlive });
+            if (!stillWritable || !btnAlive) {
+                log('页面提交已生效（离开作答态或按钮消失）');
+                return true;
+            }
+            log('页面提交无响应，转走接口提交');
+        } else {
+            log('页面无可点提交按钮，转走接口提交');
         }
-        log('页面无可点提交按钮，转走接口提交');
         // 无按钮（可能未答完/已提交）：尝试直接调接口
         const r = parseReaderRoute();
         const cid = (r && r.contentId) || CONTENT_ID || null;
@@ -2804,6 +2831,32 @@ function __TSH_NEW_ENGINE__() {
         return 'z' + PLACEHOLDER_ROUND;
     }
 
+    // 【local78】服务端 answerStatus=3（已判分）不等于页面上有答案：
+    // 实测 fill_image 的节，接口说已作答，但卡片里一个字都没有。
+    // 原来的 `if (hasUserAnswer(q)) continue` 会因此跳过填写、直接空提交。
+    function cardHasContent(card) {
+        if (!card) return false;
+        try {
+            const blanks = card.querySelectorAll('.zty-exercise-item-fill-blank-do, [contenteditable="true"]');
+            for (const b of blanks) {
+                if (String(b.textContent || '').trim()) return true;
+            }
+            const areas = card.querySelectorAll('textarea');
+            for (const t of areas) {
+                if (String(t.value || '').trim()) return true;
+            }
+            const inputs = card.querySelectorAll('input');
+            for (const i of inputs) {
+                const t = String(i.type || '').toLowerCase();
+                if (t === 'radio' || t === 'checkbox') { if (i.checked) return true; continue; }
+                if (String(i.value || '').trim()) return true;
+            }
+            const marked = card.querySelectorAll('.ant-radio-wrapper-checked, .ant-checkbox-wrapper-checked');
+            if (marked.length) return true;
+        } catch (e) {}
+        return false;
+    }
+
     function fillPlaceholder(card, type) {
         try {
             if (type === TYPE.SINGLE || type === TYPE.MULTIPLE || type === TYPE.JUDGE) {
@@ -2811,7 +2864,7 @@ function __TSH_NEW_ENGINE__() {
                 if (!opts.length) return false;
                 return selectOption(opts[0]);
             }
-            // 【本地修复 v2.3.1-local73】judge_advanced（多小题判断）原来没有占位分支：
+            // 【本地修复 v2.3.1-local78】judge_advanced（多小题判断）原来没有占位分支：
             // fillPlaceholder 落到最后的 return false，于是 retryUntilAnswer 第 1819 行
             // 「仍有无法写入的题」直接 return，一次提交都不发 → 服务端永远累计不到
             // 答错次数 → 拿不到标准答案 → 该题最终报「未能作答（judge_advanced）」。
@@ -2853,9 +2906,41 @@ function __TSH_NEW_ENGINE__() {
             if (type === TYPE.FILL || type === TYPE.FILL_DIALOG || type === TYPE.FILL_IMAGE ||
                 type === TYPE.FILL_CLOZE || type === TYPE.FILL_CLOZE_MN) {
                 const blanks = $('.zty-exercise-item-fill-blank-do', card);
-                if (blanks.length) { const v = placeholderText(); blanks.forEach(b => fillEditable(b, v)); return true; }
+                // 【local77】fill_image 的输入框常是 <input class="imgFillBlanks">，
+                // 类型也可能是 number/tel 或没有 type，原选择器直接漏掉 → 一个字都写不进去。
+                // 这里放宽为"卡片内所有可见、非选项类、非隐藏的 input"。
+                const allInputs = Array.prototype.slice.call(card.querySelectorAll('input'))
+                    .filter(i => {
+                        const t = String(i.type || '').toLowerCase();
+                        if (t === 'radio' || t === 'checkbox' || t === 'hidden' || t === 'file') return false;
+                        if (i.disabled || i.readOnly) return false;
+                        return true;
+                    });
+                log('填空占位前', {
+                    type: type,
+                    doBlanks: blanks.length,
+                    doneBlanks: card.querySelectorAll('.zty-exercise-item-fill-blank-done').length,
+                    baseBlanks: card.querySelectorAll('[class*="fill-blank"]').length,
+                    imgFill: card.querySelectorAll('.imgFillBlanks, [class*="img-fill"]').length,
+                    inputs: allInputs.length,
+                    inputTypes: allInputs.slice(0, 6).map(i => i.type || '(none)'),
+                    inputCls: allInputs.slice(0, 3).map(i => String(i.className || '').slice(0, 24))
+                });
+                if (blanks.length) {
+                    const v = placeholderText();
+                    blanks.forEach(b => fillEditable(b, v));
+                    log('填空占位后', { via: 'fill-blank-do', wrote: blanks.length });
+                    return true;
+                }
                 const inputs = $('input[type="text"], input:not([type])', card);
-                if (inputs.length) { const v2 = placeholderText(); inputs.forEach(i => fillInput(i, v2)); return true; }
+                const targets = inputs.length ? inputs : allInputs;
+                if (targets.length) {
+                    const v2 = placeholderText();
+                    targets.forEach(i => fillInput(i, v2));
+                    log('填空占位后', { via: inputs.length ? 'input[type=text]' : 'all-inputs', wrote: targets.length });
+                    return true;
+                }
+                log('填空占位后', { via: 'none', wrote: 0 });
                 return false;
             }
             if (AI_ESSAY_TYPES.has(type)) {
@@ -3485,11 +3570,16 @@ function __TSH_NEW_ENGINE__() {
             // 只补空位，其余保持原样，这样每轮提交都保住当前最好结果。
             // 注意：AI 已填满时没有空位可补，但**仍然要提交**才能累计次数，
             // 因此这里不能用"是否补了占位"作为继续条件。
-            if (forceRewrite) {
-                if (!(await ensureEditableState())) {
+            // 【local75】每轮试错前都要确保"可写"，不能只给 forceRewrite 开绿灯。
+            // 实测 fill_image / 已判分（answerStatus=3）的节：卡片停在查看态（readonly-answer），
+            // 没有可写控件 → 占位填不进去 → 提交的是空答案 → 服务端永远累计不到答错次数。
+            const editableNow = await ensureEditableState();
+            if (!editableNow) {
+                if (forceRewrite) {
                     log('重做模式下无法进入作答态，终止试错');
                     return false;
                 }
+                log('试错前无法进入作答态，本轮按当前作答提交', { round: i });
             }
             const items = getExerciseItems();
             let wroteAny = 0;
@@ -3498,7 +3588,14 @@ function __TSH_NEW_ENGINE__() {
                 const q = questions[i];
                 // forceRewrite：错题重做场景。服务端认为"已作答"（answerStatus=3），
                 // 但页面上是判错态，必须强制覆盖写入**不同的**占位值才能累计答错次数。
-                if (hasUserAnswer(q) && !forceRewrite) { wroteAny++; continue; }
+                // 【local78】再加一条：服务端说已作答、但卡片里**一个字都没有**时，
+                // 也要强制重写（否则占位填不进、直接空提交，答错次数永远不涨）。
+                const cardNow = findCardForQuestion(items, q, i);
+                const domHas = cardHasContent(cardNow);
+                if (hasUserAnswer(q) && !forceRewrite && domHas) { wroteAny++; continue; }
+                if (hasUserAnswer(q) && !domHas) {
+                    log('服务端说已作答但页面无内容，强制重写', { id: q.id, type: q.type });
+                }
                 const card = findCardForQuestion(items, q, i);
                 if (!card) { unfillable.push({ id: q.id, type: q.type, why: 'no-card' }); continue; }
                 // 组合题：正确答案在子题里，逐个子题填
@@ -4385,7 +4482,7 @@ function __TSH_NEW_ENGINE__() {
         if (questions.length) {
             // 语音评测题需真实录音，无法自动作答 —— 但不因此跳过整节。
             //
-            // 【本地修复 v2.3.1-local73】站点并没有"整节答完才能提交"的硬门禁：
+            // 【本地修复 v2.3.1-local78】站点并没有"整节答完才能提交"的硬门禁：
             // 全量前端产物里搜不到「请完成所有习题」这类文案（0 命中），
             // 而 submitAnswers() 在按钮 disabled 时会直接调提交接口，
             // 也就是说部分作答是可以提交的。因此只在这两种情况下跳过：
@@ -4548,7 +4645,7 @@ function __TSH_NEW_ENGINE__() {
                 // 注：原注释称"站点前端有硬门禁：未答完提交会被拦下"——实测不成立，
                 // 见下方 local5 的说明。此处不再假设门禁存在。
                 if (left.length) {
-                    // 【本地修复 v2.3.1-local73】先尝试提交已作答部分。
+                    // 【本地修复 v2.3.1-local78】先尝试提交已作答部分。
                     // 站点前端没有"整节答完才能提交"的硬门禁（全量产物里无相关文案），
                     // 且 submitAnswers() 在按钮 disabled 时会直接走提交接口。
                     // 只有服务端确实拒绝时，才按原逻辑跳过/停止。
@@ -5258,7 +5355,7 @@ function __TSH_OLD_ENGINE__() {
 
     // ================= 脚本有效性检测 + GitHub Issue 上报 =================
     // 用途：开源托管时，若网站改版导致脚本失效，自动向 GitHub 发 issue（需用户同意；24h 去重防刷）
-    const SCRIPT_VERSION = '2.3.1-local73'; // 与 @version 保持一致
+    const SCRIPT_VERSION = '2.3.1-local78'; // 与 @version 保持一致
     const REPORT_KEY = 'tsh_auto_brush_report';
     let reportConfig = { consent: null, consentVersion: '', enabled: false, owner: '', repo: '', token: '', lastReport: 0 };
     function loadReportConfig() {
@@ -6682,19 +6779,19 @@ function __TSH_OLD_ENGINE__() {
 
     // 供排错使用：在 Console 里执行 window.__TSH_BRUSH__ 可查看状态
     globalThis.__TSH_BRUSH__ = {
-        version: '2.3.1-local73',
+        version: '2.3.1-local78',
         engine: isNewSite ? 'new' : (isLegacySite ? 'legacy' : 'idle'),
         path: path
     };
 
     if (isNewSite) {
-        try { console.log('[刷课] 检测到新版站点，启动新版引擎 v2.3.1-local73（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
+        try { console.log('[刷课] 检测到新版站点，启动新版引擎 v2.3.1-local78（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
         __TSH_NEW_ENGINE__();
         return;
     }
 
     if (isLegacySite) {
-        try { console.log('[刷课] 检测到旧站 /legacy/，启动旧站引擎 v2.3.1-local73（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
+        try { console.log('[刷课] 检测到旧站 /legacy/，启动旧站引擎 v2.3.1-local78（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
         __TSH_OLD_ENGINE__();
         return;
     }

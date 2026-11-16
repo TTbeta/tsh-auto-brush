@@ -206,3 +206,26 @@ payload = { catalogId, contentId, questionItemList: fe(o.value, new Map(l.value.
 1. 「开始刷课」让脚本跑，能答的题型都会自动做对
 2. 遇到 `judge_advanced` / 拖拽 / 语音题，脚本跳过，手工补
 3. 判断某节是否真的做对，看日志 `提交后回查 [{st:…}]`：`st:1` 才算成
+
+---
+
+## 八、local74–local78：录音条、查看态与空提交
+
+| # | 现象 | 根因 | 版本 |
+|---|---|---|---|
+| 36 | 带录音条的填空题整节被判语音题跳过 | `[class*="record-play"]` / `[class*="record-start"]` 命中了**听力播放条**的播放按钮，被判成"有录音控件" | local74 |
+| 37 | 试错时从不点 Retry，一直空转提交 | `ensureEditableState()` 只在 `forceRewrite` 分支调用；普通试错停在查看态，占位一个字写不进 | local75 |
+| 38 | 点了 Submit 但站点毫无反应 | 点完直接 `return true`，没有任何验收 | local76（验收：离开作答态 / 按钮消失，否则转接口） |
+| 39 | `fill_image`（看图填空）一个字没写 | 输入框选择器只有 `input[type=text]`，实测控件是 `input.imgFillBlanks` | local77（放宽为所有可见非选项 input） |
+| 40 | 不输入任何文本就点 submit | `hasUserAnswer(q)` 只看接口 `answerStatus=3`，不看页面上有没有内容 | local78（`cardHasContent()` DOM 对账） |
+
+### 一条贯穿始终的经验
+
+**接口说的和页面显示的是两套状态，必须交叉验证。** 本阶段 5 个 bug 里有 4 个源于只信其中一边：
+
+- 只信接口 `answerStatus` → 页面空白也当"已作答"（#40）
+- 只信 DOM 类名 → 站点复用的包装类导致误判语音题（#1、#36）
+- 只信点击返回值 → 点了没反应也当提交成功（#38）
+- 只信 `getBoundingClientRect` → 虚拟滚动时真实卡片被判不可见（#23）
+
+判据速查表（第四节）里每一条都是"两边对账"的产物。
