@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         TSH自动刷课
-// @version      2.3.0
+// @version      2.3.1-local73
 // @namespace    wasd258-jpg.tsh-autobrush
 // @description  清华社英语在线自动刷课（双引擎版）。自动识别站点版本：新版 /course_center/ 与旧站 /legacy/ 均支持，装一次即可。功能：自动答题+章节推进+查成绩+学习时长保活。新版支持单选/多选/判断/填空/下拉/拖拽；语音题需真人录音。含结构自检。
 // @author       WASD258-jpg
@@ -44,7 +44,7 @@ function __TSH_NEW_ENGINE__() {
 
     'use strict';
 
-    const SCRIPT_VERSION = '2.3.0'; // 与 @version 保持一致
+    const SCRIPT_VERSION = '2.3.1-local73'; // 与 @version 保持一致
 
     // ============================================================================
     // 1. 新站契约常量（逆向自线上产物，构建版本 20260930165203）
@@ -94,6 +94,19 @@ function __TSH_NEW_ENGINE__() {
     // 陷阱：judge_advanced 不在此列 —— 它的 doRecord 是 JSON 数组。
     const BARE_SCALAR_TYPES = new Set([TYPE.SINGLE, TYPE.JUDGE]);
 
+    // 明确的客观题型。用途：压过站点可能给错的 obSub 标签。
+    // 【实测 2026-11】judge_advanced 的题目数据里 obSub 竟然是 'sub'，
+    // 于是 isSubjective() 把它判成主观题 → 走 AI（AI 又不支持该题型）
+    // → retryUntilAnswer 里 expectAnswer() 也把它排除 → missing 为空
+    // → 直接进「答案已齐」分支 → 回填 0 条 → 一次占位提交都没发，
+    // 服务端永远累计不到答错次数，标准答案永远拿不到。
+    const KNOWN_OBJECTIVE_TYPES = new Set([
+        TYPE.SINGLE, TYPE.MULTIPLE, TYPE.JUDGE, TYPE.JUDGE_HIGH,
+        TYPE.FILL, TYPE.FILL_DIALOG, TYPE.FILL_IMAGE, TYPE.FILL_CLOZE, TYPE.FILL_CLOZE_MN,
+        TYPE.DRAG_ONE, TYPE.DRAG_MANY, TYPE.DRAG_FILL, TYPE.DROP_IMG, TYPE.DROP_PARA,
+        TYPE.CORRECT
+    ]);
+
     // 语音评测类题型（驰声 chivox 实时评测，必须真人录音）
     const SPEECH_TYPE_LIST = [TYPE.ORAL_SPEAK, TYPE.ORAL_FOLLOW, TYPE.ORAL_ROLEPLAY, TYPE.ORAL_WORDS];
 
@@ -132,6 +145,60 @@ function __TSH_NEW_ENGINE__() {
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     const rnd = (a, b) => a + Math.floor(Math.random() * (b - a));
     const log = (...a) => { try { console.log('[刷课]', ...a); } catch (e) {} };
+
+    // 【local57】抓站点自己的提交请求体：我们的接口提交返回 200 但服务端没记录，
+    // 需要站点真实 payload 做字段对比。本脚本 @grant none 跑在页面上下文，能 hook fetch。
+    (function hookFetchForCapture() {
+        try {
+            if (window.__tshFetchCaptured) return;
+            window.__tshFetchCaptured = true;
+            const orig = window.fetch;
+            window.fetch = function (input, init) {
+                try {
+                    const url = typeof input === 'string' ? input : ((input && input.url) || '');
+                    const body = init && init.body;
+                    if (/(answer|submit)/i.test(String(url)) && body) {
+                        const txt = typeof body === 'string' ? body : '[非文本 body]';
+                        log('站点请求', { method: (init && init.method) || 'GET', url: String(url).slice(-90), body: txt.slice(0, 600) });
+                    }
+                } catch (e) {}
+                return orig.apply(this, arguments);
+            };
+        } catch (e) {}
+    })();
+
+    // 【local58】站点用 axios（XHR），fetch 钩子抓不到 → 再挂一层 XHR。
+    (function hookXHRForCapture() {
+        try {
+            if (window.__tshXhrCaptured) return;
+            window.__tshXhrCaptured = true;
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function (method, url) {
+                try { this.__tshMeta = { method: method, url: String(url || '') }; } catch (e) {}
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function (body) {
+                try {
+                    const meta = this.__tshMeta || {};
+                    if (/(answer|submit)/i.test(meta.url) && body) {
+                        const txt = typeof body === 'string' ? body : '[非文本]';
+                        log('站点XHR请求', { method: meta.method, url: meta.url.slice(-80), body: txt.slice(0, 700) });
+                        this.addEventListener('load', () => {
+                            try {
+                                log('站点XHR响应', {
+                                    status: this.status,
+                                    url: meta.url.slice(-60),
+                                    body: String(this.responseText || '').slice(0, 400)
+                                });
+                            } catch (e) {}
+                        });
+                    }
+                } catch (e) {}
+                return origSend.apply(this, arguments);
+            };
+        } catch (e) {}
+    })();
 
     // 派发完整鼠标序列（antd 组件监听 pointer/mouse 组合，顺序须与真实浏览器一致）
     function click(el) {
@@ -218,9 +285,26 @@ function __TSH_NEW_ENGINE__() {
     const RATE_LIMIT_COOLDOWN_MS = 60000;   // 与站点提示文案一致：1 分钟
     let rateLimitedUntil = 0;
 
+    // 【local33】站点除了 HTTP 429，还会用**业务文案**提示：
+    //   「操作过于频繁」「请稍后重试」「请勿重复提交」…
+    // 这些返回的 http/code 往往是 200，原来的判断只看 429 → 提示被当成正常返回，
+    // 这一步就被"吞掉"了（用户看到的就是步骤消失、答案没提交）。
+    const THROTTLE_RE = /操作过于频繁|过于频繁|请稍后|稍后重试|请勿重复提交|频繁|too\s*many|rate\s*limit|429/i;
+    let minGapMs = 900;                      // 触发过限流后自动拉大
+    let lastReqAt = 0;
+
     function isRateLimited() { return Date.now() < rateLimitedUntil; }
     function rateLimitRemainSec() { return Math.max(0, Math.ceil((rateLimitedUntil - Date.now()) / 1000)); }
-    function enterRateLimit() { rateLimitedUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS; }
+    function enterRateLimit(ms) {
+        const d = ms || RATE_LIMIT_COOLDOWN_MS;
+        rateLimitedUntil = Math.max(rateLimitedUntil, Date.now() + d);
+        minGapMs = Math.min(3500, Math.round(minGapMs * 1.6));   // 每次限流后放慢
+    }
+    async function waitGap() {
+        const gap = Date.now() - lastReqAt;
+        if (gap < minGapMs) await sleep(minGapMs - gap + rnd(0, 250));
+        lastReqAt = Date.now();
+    }
 
     async function api(path, opts) {
         opts = opts || {};
@@ -242,6 +326,7 @@ function __TSH_NEW_ENGINE__() {
         const init = { method: opts.method || 'GET', headers, credentials: 'omit' };
         if (opts.data !== undefined) init.body = JSON.stringify(opts.data);
 
+        await waitGap();
         let resp;
         try {
             resp = await fetch(url + qs, init);
@@ -251,10 +336,23 @@ function __TSH_NEW_ENGINE__() {
         let body;
         try { body = await resp.json(); } catch (e) { return { code: resp.status, message: '响应非 JSON（HTTP ' + resp.status + '）', data: null }; }
 
-        // 限流：进入本地冷却
-        if (resp.status === 429 || (body && body.code === 429)) {
+        // 限流：HTTP/业务码 429，或文案提示「操作过于频繁」等
+        const msgText = body && body.message ? String(body.message) : '';
+        if (resp.status === 429 || (body && body.code === 429) || THROTTLE_RE.test(msgText)) {
             enterRateLimit();
-            return { code: 429, message: '触发限流，已冷却 ' + (RATE_LIMIT_COOLDOWN_MS / 1000) + 's', data: null, _rateLimited: true };
+            log('触发限流（' + (msgText || ('HTTP ' + resp.status)) + '），冷却 '
+                + Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000) + 's，之后请求间隔 ' + minGapMs + 'ms');
+            status('站点提示操作过于频繁，冷却 ' + Math.ceil(RATE_LIMIT_COOLDOWN_MS / 1000) + 's 后继续');
+            return { code: 429, message: msgText || '触发限流', data: null, _rateLimited: true };
+        }
+
+        // 【local33】命中限流且允许等待时，冷却结束后自动重发一次，避免整步被吞
+        if (!opts._waited && THROTTLE_RE.test(String((body && body.message) || ''))) {
+            const waitMs = Math.max(3000, rateLimitedUntil - Date.now()) + rnd(500, 1500);
+            status('等待 ' + Math.ceil(waitMs / 1000) + 's 后重试该请求');
+            await sleep(waitMs);
+            opts._waited = true;
+            return api(path, opts);
         }
 
         // 令牌过期：尝试刷新一次后重试
@@ -471,12 +569,32 @@ function __TSH_NEW_ENGINE__() {
     // （站点模板：div.exercise-item[data-child-question-id] 位于父题 div.exercise-item 之内）。
     // 若直接 querySelectorAll('.exercise-item') 会把子题一并收进来，导致题卡索引错位、
     // 答案与题目错配。因此必须过滤掉"祖先中已有 .exercise-item"的节点。
+    // 【local44】接口返回 ≠ 页面渲染完毕。取题成功后立即读 DOM 会读到空页面
+    // （domIds=0 → 判定"页面没题卡、已完成"→ 整节跳过，且时快时慢，典型的竞态）。
+    async function waitForCards(maxMs) {
+        const limit = maxMs || 8000;
+        const t0 = Date.now();
+        for (;;) {
+            try {
+                if (getExerciseItems().length && domQuestionIds().size) return Date.now() - t0;
+            } catch (e) {}
+            if (Date.now() - t0 >= limit) return -1;
+            await sleep(400);
+        }
+    }
+
     function getExerciseItems() {
         const root = $1(SEL.readerRoot);
         if (!root) return [];
         let items = $(SEL.exerciseItem, root);
         if (!items.length) items = $(SEL.exercisePreview + ' ' + SEL.exerciseItem);
         if (!items.length) return [];
+        // 【local35】排除预加载但 display:none 的相邻内容项中的卡片
+        const shown = items.filter(el => isShownEl(el) || !!visibleContentItem(el));
+        if (shown.length) items = shown;
+        if (!items.length && $(SEL.exerciseItem).length) {
+            log('题卡全被判为不可见', { total: $(SEL.exerciseItem).length });
+        }
         const top = items.filter(el => {
             let p = el.parentElement;
             while (p && p !== root) {
@@ -501,7 +619,11 @@ function __TSH_NEW_ENGINE__() {
         if (has('.zty-exercise-view-main.listen-repeat-view')) return TYPE.ORAL_FOLLOW;
         if (has('.oral-brief-course-do') || has('.oral-brief-course-done')) return TYPE.ORAL_SPEAK;
         if (has('.drag-drop-container')) return TYPE.DRAG_ONE;
-        if (has('.judge-option-item')) return TYPE.JUDGE;
+        if (has('.judge-option-item')) {
+            // 【本地修复 local6】多行 .judge-option-item = 多小题判断（judge_advanced），
+            // 只有一行才是 judge_basic。原来一律返回 JUDGE，导致占位/回填走错分支。
+            return $('.judge-option-item', el).length > 1 ? TYPE.JUDGE_HIGH : TYPE.JUDGE;
+        }
         if (has('.zty-exercise-item-fill-blank-do') || has('span.zty-exercise-item-fill-blank-do')) return TYPE.FILL;
         if (has('input[type="radio"]') || has('.ant-radio-wrapper') || has('.ant-radio-group')) return TYPE.SINGLE;
         if (has('input[type="checkbox"]') || has('.ant-checkbox-wrapper') || has('.ant-checkbox-group')) return TYPE.MULTIPLE;
@@ -515,9 +637,96 @@ function __TSH_NEW_ENGINE__() {
     // 结构上无法靠填 DOM 作答，必须真实录音。识别出来是为了明确跳过并告知用户，而非静默失败。
     const SPEECH_TYPES = new Set(SPEECH_TYPE_LIST);
     function isSpeechType(type) { return SPEECH_TYPES.has(type); }
+
+    // 可作答控件：任意一种命中，说明这张卡能靠填 DOM 完成，不应按语音题跳过。
+    //
+    // 【本地修复 v2.3.1-local73】判据最终收敛为两条：
+    //   v2.3.0   卡片深处出现语音类名就判语音题（后代查询 → 误判填空题）
+    //   local1   加"可填控件优先"+"标记须在自身包装层"，仍漏：听力填空题的
+    //            空位是基础类 fill-blank / antd 下拉，未聚焦时不含 -do 与 contenteditable
+    //   local2   改用"录音控件"判语音题，但保留了 `|| isSpeechType(detectType(el))` 兜底，
+    //            于是「纯音频播放卡」被 detectType 判成 oral_follow_along（因为音频视图
+    //            复用 .zty-exercise-view-main.listen-repeat-view 包装类）又被误当语音题
+    //   local4   去掉题型兜底：**只有真的存在录音/播报控件才算语音题**。
+    //            纯播放音频只是题干，不是要你开口；真语音题必然有录音按钮或头像播报位。
+    const ANSWERABLE_SELECTOR = [
+        '[class*="fill-blank"]',       // 覆盖 fill-blank / -do / -done / -do-filled / fill-blank-empty
+        '[contenteditable]',           // 含 "true" 与 "false" 两态（编辑态是 false）
+        'input', 'select', 'textarea',
+        '.ant-select', '.ant-select-selector',
+        '.ant-radio-wrapper', '.ant-checkbox-wrapper',
+        '.judge-option-item',
+        '[class*="drag-drop"]',
+        // 【local40】查看态的问答题（readonly-answer / do-record）不是语音题，
+        // 它只是需要先点 Retry 回到作答态。
+        '[class*="readonly-answer"]', '[class*="do-record"]', '.answer-card-course'
+    ].join(', ');
+
+    // 只有这些才说明题目要求真人发声：录音按钮、口语图、头像播报、角色扮演容器
+    // 【local40】[class*="record"] 会命中答题容器 do-record / do-record-answer，
+    // 把每张问答题卡都判成"有录音控件"→ 整节当语音题跳过。改成精确的录音控件。
+    const RECORDING_SELECTOR = [
+        'img[title="录音"]', '.lib-oral-img',
+        '[class*="record-btn"]', '[class*="recordBtn"]', '[class*="recorder"]',
+        '[class*="record-icon"]', '[class*="record-start"]', '[class*="record-play"]',
+        '[class*="mouth"]',
+        '.avatar-view-container', '.role-play-course-container',
+        '.oral-brief-course-do', '.oral-brief-course-done'
+    ].join(', ');
+
+    // 保留给诊断用：这些类名出现在卡片里但不等于语音题
+    const SPEECH_MARKER_SELECTOR =
+        '.oral-brief-course-do, .oral-brief-course-done, .listen-repeat-view, ' +
+        '.role-play-course-container, .avatar-view-container';
+
+    function hasAnswerableControl(el) {
+        return !!el && !!$1(ANSWERABLE_SELECTOR, el);
+    }
+
+    function hasRecordingAffordance(el) {
+        return !!el && !!$1(RECORDING_SELECTOR, el);
+    }
+
     function cardNeedsSpeech(el) {
-        return isSpeechType(detectType(el)) ||
-            !!$1('.oral-brief-course-do, .listen-repeat-view, .role-play-course-container, .avatar-view-container', el);
+        if (!el) return false;
+        if (hasAnswerableControl(el)) return false;    // 能填/能选 → 按可作答题处理
+        return hasRecordingAffordance(el);             // 只有真的录音控件才算语音题
+    }
+
+    // 被跳过时打印判定依据，用于区分「真语音题」与「误判」
+    function speechDiagnosis(el) {
+        return {
+            type: detectType(el),
+            hasAnswerable: hasAnswerableControl(el),
+            hasRecControl: hasRecordingAffordance(el),
+            cardClass: el && el.className ? String(el.className).slice(0, 90) : '',
+            markers: $(SPEECH_MARKER_SELECTOR, el).map(n => String(n.className).slice(0, 40)).slice(0, 3)
+        };
+    }
+
+    // 卡片 ↔ 题目配对。
+    //
+    // 【实测 2026-11，本 bug 的根因】getExerciseItems() 只返回顶层卡片，而
+    // questions 来自 questionVOList —— 两者**数量与顺序都不保证一致**：
+    // 例如本节 4 张卡（口语×2 + 组合题父卡 + 若干）只对应 1 道题，
+    // 之前用 `items[i]` 兜底（i=0）就把**口语那张卡**当成了组合题卡，
+    // 于是 doneBlanks/subCards/controlsTotal 全是 0，看起来像"找错结构"，
+    // 实际是"拿错了卡"。这里按 data-question-id / data-child-question-id 精确配对。
+    function findCardForQuestion(items, q, fallbackIndex) {
+        if (!items || !items.length) return null;
+        if (!q) return items[fallbackIndex] || null;
+        const id = Number(q.id);
+        let hit = items.find(c => c.dataset && Number(c.dataset.questionId) === id);
+        if (hit) return hit;
+        const kids = (q.children || []).map(k => Number(k && k.id)).filter(n => Number.isFinite(n) && n > 0);
+        if (kids.length) {
+            hit = items.find(c => kids.some(kid =>
+                c.querySelector('[data-child-question-id="' + kid + '"]')));
+            if (hit) return hit;
+        }
+        hit = items.find(c => c.querySelector('.exercise-item[data-child-question-id="' + id + '"]'));
+        if (hit) return hit;
+        return items[fallbackIndex] || null;
     }
 
     // 读取卡片内的选项元素
@@ -541,6 +750,16 @@ function __TSH_NEW_ENGINE__() {
             clickSeq(optEl);
             // antd 受控组件：直接点 input 更可靠
             try { input.click(); } catch (e) {}
+            // 【local52】点击后 DOM 的 checked 未必立刻同步（Vue 下一 tick 才更新），
+            // v-model 也可能没收到变更 → 表现是"点了但一个都没勾上"。
+            // 直接置位并派发 input/change，确保模型同步。
+            try {
+                if ((input.type === 'checkbox' || input.type === 'radio') && !input.checked) {
+                    input.checked = true;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            } catch (e) {}
             return true;
         }
         const inner = $1('.option-content', optEl) || optEl;
@@ -580,6 +799,53 @@ function __TSH_NEW_ENGINE__() {
             }
         }
         q.doRecord = stringifyDoRecord(value);
+    }
+
+    // 本地占位标记：记录哪些题是"我们填的占位"，服务端尚未确认。
+    // 【local7】原来占位只写 q.doRecord 就完事，hasUserAnswer() 于是把它当真实作答，
+    // 脚本会报"已作答完成"而页面按钮还停在"提交"。
+    const PLACEHOLDER_IDS = new Set();
+
+    // 从 DOM 当前选中态编码出符合站点契约的 doRecord。
+    //
+    // 【本地修复 local7】占位也必须用**合法格式**提交，否则服务端不受理：
+    // judge_advanced 的 doRecord 是 JSON 数组（每个小题一个选项 id），
+    // 而原来 markAnswered(q, 'a') 写的是裸串 'a' —— 服务端不认，答错次数不累计，
+    // errorNumShow 的阈值永远达不到，标准答案也就永远拿不到。
+    function encodeChoiceFromDom(card, type) {
+        if (!card) return '';
+        if (type === TYPE.JUDGE_HIGH) {
+            const rows = $('.judge-option-item', card);
+            if (rows.length) {
+                const arr = rows.map(row => {
+                    const inp = $1('input:checked', row);
+                    return inp ? String(inp.value) : '';
+                });
+                return arr.some(v => v !== '') ? JSON.stringify(arr) : '';
+            }
+        }
+        const inp = $1('input:checked', card);
+        if (inp) return String(inp.value);
+        const checked = $1('.ant-radio-wrapper-checked, .ant-checkbox-wrapper-checked', card);
+        if (checked) {
+            const i2 = $1('input', checked);
+            if (i2) return String(i2.value);
+        }
+        return '';
+    }
+
+    // 写入占位后同步本地状态，并记入 PLACEHOLDER_IDS
+    function markAnsweredFromDom(q, card) {
+        if (!q) return false;
+        const enc = encodeChoiceFromDom(card, q.type);
+        if (enc) {
+            q.doRecord = enc;
+            PLACEHOLDER_IDS.add(Number(q.id));
+            return true;
+        }
+        markAnswered(q, 'a', card);
+        PLACEHOLDER_IDS.add(Number(q.id));
+        return true;
     }
 
     // 读取标准答案（来自取题接口的 questionAnswerItemVOList[].answer）
@@ -629,10 +895,26 @@ function __TSH_NEW_ENGINE__() {
 
     function normalizeFillAnswer(raw) {
         let v = raw;
+        // 【local39】问答题/写作题的标准答案是 {"annex":[],"answer":"文本"} 包了一层的对象，
+        // 直接 String() 会得到 JSON 字符串写进 textarea。
+        if (v && typeof v === 'object' && !Array.isArray(v) && v.answer !== undefined) {
+            v = v.answer;
+        }
         if (typeof v === 'string') {
             const s = v.trim();
             if (!s) return null;
             try { v = JSON.parse(s); } catch (e) { return s; }   // 普通文本答案
+            // 【local46】解析后可能变成 {"annex":[],"answer":"…"}：
+            // 上面那次解包只覆盖"传进来就是对象"的情况，字符串解出来的没人管，
+            // 于是落到结尾返回 null，回填被静默跳过。
+            if (v && typeof v === 'object' && !Array.isArray(v)) {
+                if (v.answer !== undefined && v.answer !== null && String(v.answer).trim()) {
+                    return String(v.answer).trim();
+                }
+                if (v.standardAnswer !== undefined && String(v.standardAnswer).trim()) {
+                    return String(v.standardAnswer).trim();
+                }
+            }
         }
         if (Array.isArray(v)) {
             const structured = v.some(x => x && typeof x === 'object' &&
@@ -807,6 +1089,7 @@ function __TSH_NEW_ENGINE__() {
     function isSubjective(q) {
         if (!q) return false;
         if (q.children && q.children.length) return q.children.some(isSubjective);
+        if (q.type && KNOWN_OBJECTIVE_TYPES.has(q.type)) return false;   // 客观题型压过 obSub 标签
         if (String(q.obSub || '').toLowerCase() === 'sub') return true;
         return AI_ESSAY_TYPES.has(q.type);      // 写作 / 翻译 / 问答
     }
@@ -1152,11 +1435,156 @@ function __TSH_NEW_ENGINE__() {
         return data;
     }
 
+    // 解析当前章节的 contentId。
+    //
+    // 【实测 2026-11】阅读器 URL 可能只有 ?catalogId=… 而**没有** contentId
+    // （站点用 SPA 状态渲染内容，不回写 URL）。原实现直接读 query 参数，
+    // 拿不到就 return null —— doOneRound 于是立刻返回，日志里连「取题失败」
+    // 都没有，表现就是「点做一轮→两秒后本轮完成、页面一个字没动」。
+    // 三级兜底：
+    //   a) 站点自己发出的取题请求 URL 里带着 contentId（performance 资源计时可见）
+    //   b) 该 catalog 的内容项列表的第一个
+    //   c) DOM 上可能挂的 data-content-id
+    // 【local18】parseReaderRoute() 每次调用都新建对象，回填到局部 r 上等于没回填：
+    // submitAnswers() / apiMarkContentDone() 里重新 parse 一次就又是 contentId=null，
+    // 于是提交走到 `if (!r || !r.contentId) return false` —— 静默失败，日志里连
+    // 「提交失败」都没有。这里改成模块级缓存。
+    let CONTENT_ID = null;
+    function currentContentId() {
+        const r = parseReaderRoute();
+        return (r && r.contentId) || CONTENT_ID || null;
+    }
+
+    // 从 DOM 里收集「当前这一节真实在显示的题目 id」
+    //   组合题子卡：div.exercise-item[data-child-question-id="20411"]
+    //   普通卡：可能带 data-question-id
+    function domQuestionIds(scopeEl) {
+        const ids = new Set();
+        const okScope = (el) => {
+            if (!el) return false;
+            if (scopeEl) return scopeEl.contains(el);
+            return isShownEl(el) || !!visibleContentItem(el);
+        };
+        try {
+            $('[data-child-question-id]').forEach(el => {
+                if (!okScope(el)) return;
+                const v = Number(el.getAttribute('data-child-question-id'));
+                if (Number.isFinite(v) && v > 0) ids.add(v);
+            });
+            $('[data-question-id]').forEach(el => {
+                if (!okScope(el)) return;
+                const v = Number(el.getAttribute('data-question-id'));
+                if (Number.isFinite(v) && v > 0) ids.add(v);
+            });
+            // 【local49】很多题卡既没有 data-question-id 也没有 data-child-question-id，
+            // 题号只出现在题干容器的 id 上：<div id="do_20458" class="stem-content">。
+            // 不读这个来源 → domIds 恒为 0 → contentId 只能盲选候选 → 提交写错内容。
+            $('[id^="do_"], [id^="do-"]').forEach(el => {
+                if (!okScope(el)) return;
+                const m = String(el.id || '').match(/^do[-_](\d+)$/);
+                if (m) ids.add(Number(m[1]));
+            });
+        } catch (e) {}
+        return ids;
+    }
+
+    // 同一 catalog 的校验结果缓存：避免每轮都发起 2~5 次探测请求（正是限流的主要来源）
+    const CONTENT_ID_CACHE = new Map();
+
+    async function resolveContentId(r) {
+        if (r && r.contentId) { CONTENT_ID = r.contentId; return r.contentId; }
+        const cacheKey = r ? (r.bizId + '|' + r.catalogId) : '';
+        if (cacheKey && CONTENT_ID_CACHE.has(cacheKey)) {
+            CONTENT_ID = CONTENT_ID_CACHE.get(cacheKey);
+            return CONTENT_ID;
+        }
+
+        // 候选集合：performance 里出现过的 + 本 catalog 的内容项列表
+        const cands = [];
+        const push = (v) => {
+            const n = Number(v);
+            if (Number.isFinite(n) && n > 0 && cands.indexOf(n) < 0) cands.push(n);
+        };
+        try {
+            const perf = (performance.getEntriesByType ? performance.getEntriesByType('resource') : []) || [];
+            // 【local34】页面渲染可见内容项时先请求 /content/<id>/list，再请求 /content/<id>/answer。
+            // 只认 answer 会漏掉正好在屏幕上那一项，因此两类都收。
+            for (let i = perf.length - 1; i >= 0 && cands.length < 8; i--) {
+                const m = String(perf[i].name || '').match(/\/content\/(\d+)\/(?:answer|list)/);
+                if (m) push(m[1]);
+            }
+        } catch (e) {}
+        try {
+            if (r && r.catalogId) {
+                const c = await apiGetContent(r.bizId, r.catalogId, r.contentType);
+                const list = Array.isArray(c && c.data) ? c.data : ((c && c.data && c.data.list) || []);
+                list.forEach(x => x && x.id && push(x.id));
+            }
+        } catch (e) {}
+
+        // 【local21】用 DOM 上的题目 id 做**确定性**校验：
+        // 候选 contentId 取回的题目 id（含子题 id）只要与 DOM 里出现的 id 有交集，
+        // 就认定它就是屏幕上这一节。纯 performance 猜测会出现「取到别的节」的错位。
+        const domIds = domQuestionIds();
+        // 【local34】命中一个 id 就返回太脆：相邻内容项也会有个别 id 撞上。
+        // 改为遍历候选、按交集数量打分，取分最高的；交集 >= min(3, domIds) 时提前结束。
+        let best = null;
+        const scores = [];
+        for (const cid of cands.slice(0, 7)) {
+            try {
+                const resp = await apiGetExercise(cid, r && r.contentType, r && r.bizId, null);
+                const qs = (resp && resp.data && resp.data.questionVOList) || [];
+                const apiIds = new Set();
+                const walk = (arr) => (arr || []).forEach(q => {
+                    if (q && q.id) apiIds.add(Number(q.id));
+                    if (q && q.children && q.children.length) walk(q.children);
+                });
+                walk(qs);
+                let score = 0;
+                domIds.forEach(id => { if (apiIds.has(id)) score++; });
+                scores.push({ cid: cid, score: score, apiIds: apiIds.size });
+                if (score > 0 && (!best || score > best.score)) best = { cid: cid, score: score, apiIds: apiIds.size };
+                if (score >= Math.min(3, domIds.size)) break;
+            } catch (e) {}
+            await sleep(rnd(400, 800));
+        }
+        if (best) {
+            CONTENT_ID = best.cid;
+            if (cacheKey) CONTENT_ID_CACHE.set(cacheKey, best.cid);
+            log('contentId 经 DOM 打分命中', {
+                cid: best.cid,
+                score: best.score,
+                domIds: domIds.size,
+                apiIds: best.apiIds,
+                all: scores
+            });
+            return best.cid;
+        }
+
+        // 校验不成立时退回第一个候选（保持旧行为），但要明确告知
+        if (cands.length) {
+            CONTENT_ID = cands[0];
+            if (cacheKey) CONTENT_ID_CACHE.set(cacheKey, cands[0]);
+            log('contentId 未能与 DOM 校验一致，退回第一个候选', { picked: cands[0], candidates: cands, domIds: Array.from(domIds).slice(0, 8) });
+            return CONTENT_ID;
+        }
+        return null;
+    }
+
     // 拉取当前章节题目（含标准答案）
     async function loadCurrentExercise() {
         const r = parseReaderRoute();
-        if (!r || !r.contentId) return null;
-        const resp = await apiGetExercise(r.contentId, r.contentType, r.bizId, null);
+        if (!r) return null;
+        const cid = await resolveContentId(r);
+        if (!cid) {
+            status('无法确定本节 contentId（URL 只有 catalogId=' + r.catalogId + '，目录项也取不到），本轮跳过');
+            return null;
+        }
+        if (!r.contentId) {
+            r.contentId = cid;                                  // 回填，供后续 apiMarkContentDone 等使用
+            log('contentId 由兜底解析得到', cid);
+        }
+        const resp = await apiGetExercise(cid, r.contentType, r.bizId, null);
         if (!resp || resp.code !== 200 || !resp.data) {
             status('取题失败：' + (resp && resp.message ? resp.message : '未知错误'));
             return null;
@@ -1168,6 +1596,63 @@ function __TSH_NEW_ENGINE__() {
         const k = lastAnswerMap.size;
         const done = (resp.data.questionVOList || []).filter(hasUserAnswer).length;
         log('取题成功：题目 ' + n + '，已答 ' + done + '，答案条目 ' + k, resp.data);
+        // 【local44】等题卡挂载，避免拿空 DOM 下判断
+        try {
+            const waited = await waitForCards(8000);
+            log('等待题卡挂载', { ms: waited, cards: getExerciseItems().length, domIds: domQuestionIds().size });
+        } catch (e) {}
+        // 【local38】站点到底会不会给这类题下发标准答案？把每条答案的状态压成一行，
+        // 避免大 JSON 被日志行上限截断后看不见关键字段。
+        try {
+            const items = resp.data.questionAnswerItemVOList || [];
+            const allQ = [];
+            const walkQ = (arr) => (arr || []).forEach(q => {
+                allQ.push(q);
+                if (q && q.children && q.children.length) walkQ(q.children);
+            });
+            walkQ(resp.data.questionVOList || []);
+            const typeOf = (id) => {
+                const q = allQ.find(x => Number(x.id) === Number(id));
+                return q ? (q.type || '?') : '?';
+            };
+            log('答案条目摘要', items.slice(0, 10).map(it => ({
+                qid: Number(it.questionId || it.id),
+                type: typeOf(it.questionId || it.id),
+                st: it.answerStatus,
+                score: it.score,
+                hasAns: !!(it.answer && String(it.answer).trim()),
+                ansLen: it.answer ? String(it.answer).length : 0
+            })));
+        } catch (e) {}
+        // 【local34】对账：接口回来的题目 id 是否覆盖页面上的卡片 id。
+        // 覆盖不全 = contentId 选错或该 content 只含部分题目，提前暴露，
+        // 免得又走成「已作答完成 → 整节跳过」。
+        try {
+            const domIds = domQuestionIds();
+            const apiIds = new Set();
+            const walkIds = (arr) => (arr || []).forEach(q => {
+                if (q && q.id) apiIds.add(Number(q.id));
+                if (q && q.children && q.children.length) walkIds(q.children);
+            });
+            walkIds(resp.data.questionVOList || []);
+            let hit = 0;
+            domIds.forEach(id => { if (apiIds.has(id)) hit++; });
+            log('题目对账', {
+                domIds: domIds.size,
+                apiIds: apiIds.size,
+                overlap: hit,
+                ok: domIds.size ? (hit === domIds.size) : '页面未读到题目 id'
+            });
+            if (domIds.size && hit < domIds.size) {
+                status('注意：接口题目未覆盖页面全部卡片（' + hit + '/' + domIds.size + '），可能仍有题目被跳过');
+            }
+        } catch (e) {}
+        // 【local7】服务端已确认记录的题，撤掉本地占位标记（避免误报"只有本地占位"）
+        (resp.data.questionVOList || []).forEach(q => {
+            if (q && !(q.children && q.children.length) && hasUserAnswer(q)) {
+                PLACEHOLDER_IDS.delete(Number(q.id));
+            }
+        });
         return resp.data;
     }
 
@@ -1221,10 +1706,30 @@ function __TSH_NEW_ENGINE__() {
         const list = (currentResp && currentResp.questionVOList) || [];
         let filled = 0;
 
-        for (let i = 0; i < items.length; i++) {
-            const card = items[i];
-            const q = list[i] || list.find(x => Number(x.id) === Number(card.dataset.questionId));
-            if (!q) continue;
+        for (let i = 0; i < list.length; i++) {
+            const q = list[i];
+            const card = findCardForQuestion(items, q, i);
+            if (!card || !q) continue;
+
+            // 组合题：答案在子题上，逐个子题回填
+            if (q.children && q.children.length) {
+                // 【local42】查看态（readonly-answer）没有输入框，先点 Retry 回到作答态
+                if (!firstEditableControl()) {
+                    const okState = await ensureEditableState(card);
+                    log('组合题回填前确保作答态', { ok: okState });
+                    if (okState) await sleep(rnd(500, 900));
+                }
+                const n = await applyCompositeAnswers(card, q);
+                log('组合题回填', {
+                    filled: n,
+                    kids: q.children.length,
+                    subCards: card.querySelectorAll('.exercise-item[data-child-question-id]').length,
+                    childAnswerIds: q.children.map(c => Number(c.id)).slice(0, 6)
+                });
+                if (n) filled += n;
+                await sleep(rnd(120, 260));
+                continue;
+            }
 
             const type = q.type || detectType(card);
             const ans = lastAnswerMap.get(Number(q.id));
@@ -1234,7 +1739,11 @@ function __TSH_NEW_ENGINE__() {
             const value = AI_FILL_TYPES.has(type) ? normalizeFillAnswer(ans.answer) : decodeAnswer(ans.answer, type);
             if (value === null || value === undefined) continue;
 
-            const ok = applyAnswer(card, type, value);
+            const ok = (type === TYPE.JUDGE_HIGH)
+                ? await applyJudgeHigh(card, q, value)
+                : (type === TYPE.MULTIPLE
+                    ? await fillMultipleChoice(card, value)
+                    : (type === TYPE.SINGLE ? await fillSingleChoice(card, value) : applyAnswer(card, type, value)));
             if (ok) { markAnswered(q, value, card); filled++; }
             await sleep(rnd(120, 260));
         }
@@ -1319,6 +1828,21 @@ function __TSH_NEW_ENGINE__() {
     //   dragfillblank                → [{ idx:"<blankId>",  answer:"<拖拽项idx>" }]（扁平）
     function applyDragAnswer(card, type, value) {
         try {
+            // 【local73】先量清这页拖拽题的真实结构：拖拽源、投放区、是否用 HTML5 DnD。
+            try {
+                const drags = card.querySelectorAll('[draggable="true"]');
+                const zones = card.querySelectorAll('.drop-zone-item-wrapper, .drop-zone-list, .drag-drop-container, [class*="drop-zone"], [class*="blank-placeholder"]');
+                const pairs = normalizeDragPairs(type, value);
+                log('拖拽结构', {
+                    type: type,
+                    draggable: drags.length,
+                    dropZones: zones.length,
+                    pairs: pairs.length,
+                    sampleDraggable: drags.length ? String(drags[0].className || drags[0].tagName).slice(0, 50) : null,
+                    sampleZone: zones.length ? String(zones[0].className || zones[0].tagName).slice(0, 50) : null,
+                    firstPair: pairs[0] ? { zone: pairs[0].zone, item: String(pairs[0].item).slice(0, 20) } : null
+                });
+            } catch (e) {}
             const pairs = normalizeDragPairs(type, value);
             if (!pairs.length) return false;
 
@@ -1459,6 +1983,276 @@ function __TSH_NEW_ENGINE__() {
     }
 
     // 按题型把答案写入 DOM
+    // 【local65】多选必须异步填：clickSeq 会同步触发 v-model 变更 → Vue 重建整组选项，
+    // 手里那个 input 立刻变成脱离文档的死节点，写 checked 等于写进虚空。
+    // 所以要「点击 → 等重建 → 重新取节点 → 置位 → 再验证」，全程 await。
+    // 【local66】单选题与多选同一病根：antd 受控组件在 click 后重建整组 radio，
+    // 手里的 input 立刻失效。同样要「点击 → 等 → 重新取节点 → 置位 → 验证」，
+    // 并且按 input.value === 答案 uuid 精确匹配（不能按下标）。
+    // 【local67】判断题只有两个选项：答错就等价于"答案是另一个"。
+    // 不需要跑 errorNumShow 轮试错，直接取反提交一次即可。
+    // 【local70】judge_advanced 是"多行对/错"：每个 topic 一组 radio（name 相同）。
+    // flipJudgeAnswer 只处理"两个选项"的单行判断，这里按 radio group 逐行取反。
+    // 【local71】不碰 UI 的取反：选项值可从 DOM 读，答案格式已知，
+    // 直接算出"另一个答案"写进提交模型走接口。彻底绕开 antd 节点重建问题。
+    function computeFlippedAnswer(card, q) {
+        const vals = getOptionValues(card).filter(v => v !== '');
+        const cur = String((q && q.doRecord) || '').trim();
+        // 1) 单值型（判断题 / 两选项单选）：换另一个 uuid
+        if (q.type === TYPE.JUDGE || q.type === TYPE.SINGLE || vals.length === 2) {
+            if (vals.length !== 2) return undefined;
+            const other = vals[0] === cur ? vals[1] : (vals[1] === cur ? vals[0] : vals[vals.length - 1]);
+            if (!other || other === cur) return undefined;
+            return other;
+        }
+        // 2) judge_advanced：doRecord = [{idx: topic, answer: option}]
+        if (q.type === TYPE.JUDGE_HIGH) {
+            let ext = null;
+            try { ext = typeof q.extension === 'string' ? JSON.parse(q.extension) : q.extension; } catch (e) { return undefined; }
+            const opts = (ext && ext.option) || [];
+            const topics = (ext && ext.topic) || [];
+            if (!opts.length || !topics.length) return undefined;
+            const curMap = {};
+            try { (JSON.parse(cur) || []).forEach(it => { if (it && it.idx) curMap[it.idx] = it.answer; }); } catch (e) {}
+            return topics.map(t => {
+                const chosen = curMap[t.idx];
+                const other = opts.find(o => o.idx !== chosen) || opts[0];
+                return { idx: t.idx, answer: other.idx };
+            });
+        }
+        return undefined;
+    }
+
+    // 【local72】judge_advanced 是 n 个 topic × 2 选项 = 2^n 种组合，
+    // "全部取反"只有 1/2^n 的概率对。要稳拿分只能穷举：每种组合提交一次，判对即停。
+    async function readQuestionStatus(qid) {
+        try {
+            const r = parseReaderRoute();
+            const cid = (r && r.contentId) || CONTENT_ID;
+            const resp = await apiGetExercise(cid, r && r.contentType, r && r.bizId, null);
+            const items = (resp && resp.data && resp.data.questionAnswerItemVOList) || [];
+            const it = items.find(x => Number(x.questionId) === Number(qid)) || items.find(x => Number(x.id) === Number(qid));
+            return it ? { st: Number(it.answerStatus), answer: it.answer || '' } : null;
+        } catch (e) { return null; }
+    }
+
+    // 【local73】穷举按用户要求停用：32 次提交太慢太吵，判断题不再穷举。
+    const BRUTE_JUDGE_ENABLED = false;
+
+    async function bruteForceJudge(q, card) {
+        if (!BRUTE_JUDGE_ENABLED) return false;
+        let topics = [], opts = [];
+        const curArr = (() => {
+            try { return JSON.parse(String(q.doRecord || '[]')) || []; } catch (e) { return []; }
+        })();
+        if (q.type === TYPE.JUDGE_HIGH) {
+            let ext = null;
+            try { ext = typeof q.extension === 'string' ? JSON.parse(q.extension) : q.extension; } catch (e) { return false; }
+            topics = (ext && ext.topic) || [];
+            opts = (ext && ext.option) || [];
+            if (!topics.length || opts.length < 2) return false;
+        } else {
+            // 两选项单行判断：直接把两个值当"选项"
+            const vals = getOptionValues(card).filter(v => v !== '');
+            if (vals.length !== 2) return false;
+            topics = [{ idx: '_' }];
+            opts = [{ idx: vals[0] }, { idx: vals[1] }];
+        }
+        const n = Math.min(topics.length, 6);
+        const total = 1 << n;
+        // 起点：沿用当前作答（若能解析），否则从全 0 开始
+        const curMap = {};
+        (Array.isArray(curArr) ? curArr : []).forEach(it => { if (it && it.idx) curMap[it.idx] = it.answer; });
+
+        for (let m = 0; m < total; m++) {
+            let ans;
+            if (q.type === TYPE.JUDGE_HIGH) {
+                ans = topics.map((t, i) => {
+                    const bit = (m >> i) & 1;
+                    return { idx: t.idx, answer: opts[bit % opts.length].idx };
+                });
+            } else {
+                ans = opts[m & 1].idx;
+            }
+            markAnswered(q, ans, card);
+            status('判断题穷举 ' + (m + 1) + '/' + total);
+            const ok = await submitAnswers(true);
+            if (!ok) { log('穷举提交失败', { m: m }); continue; }
+            await sleep(rnd(700, 1200));
+            const st = await readQuestionStatus(q.id);
+            log('穷举回查', { try: m + 1, total: total, st: st && st.st, hasAns: !!(st && st.answer) });
+            if (st && st.st === 1) {
+                status('判断题穷举成功（第 ' + (m + 1) + '/' + total + ' 种）');
+                return true;
+            }
+            if (st && st.answer) {
+                // 服务端终于下发答案 → 直接按答案提交
+                const val = decodeAnswer(st.answer, q.type);
+                markAnswered(q, val, card);
+                await submitAnswers(true);
+                const st2 = await readQuestionStatus(q.id);
+                log('按下发答案提交', { st: st2 && st2.st });
+                if (st2 && st2.st === 1) return true;
+            }
+        }
+        return false;
+    }
+
+    async function flipJudgeRows(card) {
+        const q2 = 'input[type="radio"], input[type="checkbox"]';
+        const all = Array.prototype.slice.call(card.querySelectorAll(q2));
+        const names = [];
+        all.forEach(i => { const k = i.name || '_'; if (names.indexOf(k) < 0) names.push(k); });
+        let flipped = 0;
+        for (const name of names) {
+            const pick = () => Array.prototype.slice.call(card.querySelectorAll(q2))
+                .filter(i => (i.name || '_') === name);
+            let group = pick();
+            if (group.length !== 2) continue;
+            const curIdx = group.findIndex(i => i.checked);
+            const targetIdx = curIdx === 0 ? 1 : 0;
+            let t = pick()[targetIdx];
+            if (!t) continue;
+            try { clickSeq(t.closest('.ant-radio-wrapper, .ant-checkbox-wrapper') || t); } catch (e) {}
+            await sleep(110);
+            t = pick()[targetIdx] || t;
+            try {
+                if (!t.checked) {
+                    t.checked = true;
+                    t.dispatchEvent(new Event('input', { bubbles: true }));
+                    t.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            } catch (e) {}
+            if (t.checked) flipped++;
+        }
+        log('多行判断取反', { rows: names.length, flipped: flipped });
+        return flipped;
+    }
+
+    async function flipJudgeAnswer(card, q) {
+        const opts = getOptions(card);
+        if (opts.length !== 2) {
+            log('判断题选项数异常', { n: opts.length, id: q && q.id });
+            return false;
+        }
+        const valOf = (o) => {
+            const inp = o.querySelector ? o.querySelector('input') : null;
+            return inp ? String(inp.value || '') : '';
+        };
+        const cur = String((q && q.doRecord) || '').trim();
+        let curIdx = -1;
+        if (cur) {
+            for (let i = 0; i < opts.length; i++) {
+                if (valOf(opts[i]) === cur) { curIdx = i; break; }
+            }
+        }
+        if (curIdx < 0) {
+            for (let i = 0; i < opts.length; i++) {
+                const inp = opts[i].querySelector ? opts[i].querySelector('input') : null;
+                if (inp && inp.checked) { curIdx = i; break; }
+            }
+        }
+        const targetIdx = curIdx === 0 ? 1 : 0;
+        const target = getOptions(card)[targetIdx];
+        if (!target) return false;
+        try { clickSeq(target); } catch (e) {}
+        await sleep(120);
+        const again = getOptions(card)[targetIdx] || target;
+        const inp2 = again.querySelector ? again.querySelector('input') : null;
+        try {
+            if (inp2 && !inp2.checked) {
+                inp2.checked = true;
+                inp2.dispatchEvent(new Event('input', { bubbles: true }));
+                inp2.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        } catch (e) {}
+        await sleep(80);
+        const nowInp = (getOptions(card)[targetIdx] || again).querySelector
+            ? (getOptions(card)[targetIdx] || again).querySelector('input') : null;
+        const ok = !!(nowInp && nowInp.checked);
+        const newVal = nowInp ? String(nowInp.value || '') : valOf(target);
+        log('判断取反', { id: q && q.id, from: curIdx, to: targetIdx, newVal: newVal.slice(0, 12), ok: ok });
+        if (!ok) return false;
+        markAnswered(q, newVal, card);
+        return true;
+    }
+
+    async function fillSingleChoice(card, value) {
+        const idv = typeof value === 'object' ? (value && value.idx) : value;
+        if (idv === undefined || idv === null || idv === '') return false;
+        const want = String(idv);
+        const findOpt = () => {
+            const opts = getOptions(card);
+            for (const o of opts) {
+                const inp = o.querySelector ? o.querySelector('input') : null;
+                if (inp && String(inp.value) === want) return { opt: o, inp: inp };
+            }
+            return null;
+        };
+        let hit = findOpt();
+        if (!hit) {
+            log('单选未匹配到选项', {
+                want: want.slice(0, 12),
+                domValues: getOptionValues(card).slice(0, 8)
+            });
+            return false;
+        }
+        try { clickSeq(hit.opt); } catch (e) {}
+        await sleep(120);
+        hit = findOpt() || hit;
+        try {
+            if (!hit.inp.checked) {
+                hit.inp.checked = true;
+                hit.inp.dispatchEvent(new Event('input', { bubbles: true }));
+                hit.inp.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        } catch (e) {}
+        await sleep(80);
+        const now = findOpt();
+        const ok = !!(now && now.inp.checked);
+        log('单选回填', { want: want.slice(0, 12), checked: ok, optsNow: getOptions(card).length });
+        return ok;
+    }
+
+    async function fillMultipleChoice(card, value) {
+        const ids = (Array.isArray(value) ? value : [value]).map(v => String(v));
+        const findOpt = (idv) => {
+            const opts = getOptions(card);
+            for (const o of opts) {
+                const inp = o.querySelector ? o.querySelector('input') : null;
+                if (inp && String(inp.value) === idv) return { opt: o, inp: inp };
+            }
+            return null;
+        };
+        const missing = [];
+        let okCount = 0;
+        for (const idv of ids) {
+            let hit = findOpt(idv);
+            if (!hit) { missing.push(idv.slice(0, 8)); continue; }
+            try { clickSeq(hit.opt); } catch (e) {}
+            await sleep(120);                       // 等 Vue 重建
+            hit = findOpt(idv) || hit;              // 重新取最新节点
+            try {
+                if (!hit.inp.checked) {
+                    hit.inp.checked = true;
+                    hit.inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    hit.inp.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            } catch (e) {}
+            await sleep(80);
+            const now = findOpt(idv);
+            if (now && now.inp.checked) okCount++;
+        }
+        log('多选回填', {
+            wantN: ids.length,
+            checkedMatched: okCount,
+            optsNow: getOptions(card).length,
+            missing: missing.slice(0, 4),
+            ok: okCount >= ids.length
+        });
+        return okCount >= ids.length;
+    }
+
     function applyAnswer(card, type, value) {
         try {
             switch (type) {
@@ -1485,12 +2279,54 @@ function __TSH_NEW_ENGINE__() {
                     return any;
                 }
                 case TYPE.MULTIPLE: {
-                    const idxs = resolveOptionIndexes(card, value);
-                    if (!idxs.length) return false;
-                    const opts = getOptions(card);
+                    // 【local63】不能按下标点选项：实测同一张卡里可能混着 12 个选项元素
+                    // （题目选项 + 其他小题的选项），下标一错位就只勾上 1 个。
+                    // 改为按 input.value === 答案 uuid 精确匹配，与顺序无关。
+                    const ids = (Array.isArray(value) ? value : [value]).map(v => String(v));
+                    const findOpt = (idv) => {
+                        const opts = getOptions(card);          // 每次重新查询（Vue 会重建节点）
+                        for (const o of opts) {
+                            const inp = o.querySelector ? o.querySelector('input') : null;
+                            if (inp && String(inp.value) === idv) return { opt: o, inp: inp };
+                        }
+                        return null;
+                    };
                     let any = false;
-                    for (const i of idxs) { if (selectOption(opts[i])) any = true; }
-                    return any;
+                    const missing = [];
+                    for (const idv of ids) {
+                        const hit = findOpt(idv);
+                        if (!hit) { missing.push(idv.slice(0, 8)); continue; }
+                        try { clickSeq(hit.opt); } catch (e) {}
+                        try {
+                            if (hit.inp.type === 'checkbox' || hit.inp.type === 'radio') {
+                                hit.inp.checked = true;
+                                hit.inp.dispatchEvent(new Event('input', { bubbles: true }));
+                                hit.inp.dispatchEvent(new Event('change', { bubbles: true }));
+                            } else {
+                                hit.inp.click();
+                            }
+                            any = true;
+                        } catch (e) {}
+                    }
+                    const after = getOptions(card);
+                    const checkedIds = after.filter(o => {
+                        const inp = o.querySelector ? o.querySelector('input') : null;
+                        return (inp && inp.checked) || /-checked/.test(String(o.className || ''));
+                    }).map(o => {
+                        const inp = o.querySelector ? o.querySelector('input') : null;
+                        return inp ? String(inp.value || '') : '?';
+                    });
+                    const hitCount = ids.filter(idv => checkedIds.indexOf(idv) >= 0).length;
+                    log('多选回填', {
+                        wantN: ids.length,
+                        checkedMatched: hitCount,
+                        checkedTotal: checkedIds.length,
+                        optsNow: after.length,
+                        missing: missing.slice(0, 4),
+                        ok: hitCount >= ids.length
+                    });
+                    if (!any) return false;
+                    return hitCount >= ids.length;
                 }
                 case TYPE.FILL:
                 case TYPE.FILL_DIALOG:
@@ -1557,56 +2393,371 @@ function __TSH_NEW_ENGINE__() {
     }
 
     // 点击提交按钮（antd a-button，文案 Submit）
-    function findSubmitButton() {
-        const btns = $('button.ant-btn, button', $1(SEL.exercisePreview) || document);
-        for (const b of btns) {
-            const t = (b.textContent || '').trim();
-            if (/^Submit$/i.test(t) || /^提交$/.test(t)) return b;
+    // 【local25】原来的按钮查找只认 `button` 且文本必须**精确**等于 Submit/Retry。
+    // 实测本站按钮常是 antd 的 `<div class="ant-btn">`、或 .ly-button 这类自绘元素，
+    // 文本也可能带空格/后缀，于是 findRetryButton() 恒为 null →
+    // 「无法进入作答态（重做按钮不可用）」。改为：多选择器 + 宽松匹配。
+    // 【local28】「真人式点击」：先滚动进视口，再按坐标取**命中的最顶层元素**派事件。
+    // 本站的 Retry 是 div.right-button，监听器多半挂在内层 span/图标上；
+    // 对包装层合成事件 Vue 不认，所以手动点有效、脚本点无效。
+    function realClick(el, label) {
+        if (!el) return false;
+        try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+        const r = el.getBoundingClientRect();
+        if (!r || r.width <= 0 || r.height <= 0) {
+            log('realClick: 元素不可见，退回普通 click', { label: label, rect: [Math.round(r ? r.width : 0), Math.round(r ? r.height : 0)] });
+            clickSeq(el);
+            try { el.click(); } catch (e) {}
+            return true;
         }
+        const x = Math.round(r.left + r.width / 2);
+        const y = Math.round(r.top + r.height / 2);
+        let hit = el;
+        try { hit = document.elementFromPoint(x, y) || el; } catch (e) {}
+        log('realClick 落点', {
+            label: label,
+            hit: hit.tagName,
+            hitCls: String(hit.className || '').slice(0, 40),
+            x: x, y: y
+        });
+        const seq = ['pointerover', 'pointerenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+        const fire = (node) => {
+            if (!node) return;
+            seq.forEach(type => {
+                const isPointer = type.indexOf('pointer') === 0;
+                const opts = {
+                    bubbles: true, cancelable: true, composed: true,
+                    clientX: x, clientY: y, view: window, button: 0,
+                    buttons: type.indexOf('down') >= 0 ? 1 : 0
+                };
+                try {
+                    node.dispatchEvent(isPointer ? new PointerEvent(type, opts) : new MouseEvent(type, opts));
+                } catch (e) {}
+            });
+            try { node.click(); } catch (e) {}
+        };
+        fire(hit);
+        if (hit !== el) fire(el);
+        if (el.parentElement) fire(el.parentElement);
+        return true;
+    }
+
+    // 【local35】"隐藏"判定要更宽：预加载的相邻内容项是 display:none → 尺寸 0。
+    // 用它把不可见 content-item 里的卡片和题目 id 全部排除，
+    // 否则 domIds / 提交按钮都会指到看不见的那些上。
+    // 【local41】不能用"尺寸为 0"判不可见：虚拟滚动/过渡动画期间真实题卡也会是 0×0，
+    // 结果整页题卡全被判隐藏 → domIds=0 → 回填 0 题 → 直接宣布"已完成"。
+    // 只看祖先链上有没有 display:none / visibility:hidden（预加载内容项正是 display:none）。
+    function isShownEl(el) {
+        if (!el) return false;
+        let n = el;
+        try {
+            while (n && n.nodeType === 1) {
+                const st = window.getComputedStyle(n);
+                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                n = n.parentElement;
+            }
+        } catch (e) { return true; }
+        return true;
+    }
+
+    function visibleContentItem(el) {
+        const ci = el && el.closest ? el.closest('.content-item') : null;
+        if (!ci) return null;
+        return isShownEl(ci) ? ci : null;
+    }
+
+    function isVisibleEl(el) {
+        if (!el) return false;
+        try {
+            const r = el.getBoundingClientRect();
+            if (!r || r.width <= 0 || r.height <= 0) return false;
+            const cs = getComputedStyle(el);
+            if (!cs) return true;
+            if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+            if (Number(cs.opacity) === 0) return false;
+            return true;
+        } catch (e) { return true; }
+    }
+
+    function findClickableByText(re, extraSelector) {
+        const scope = $1(SEL.exercisePreview) || document;
+        const sel = 'button, .ant-btn, [role="button"], .ly-button' + (extraSelector ? ', ' + extraSelector : '');
+        const els = $(sel, scope);
+        const matched = [];
+        for (let i = 0; i < els.length; i++) {
+            const el = els[i];
+            if (el.disabled) continue;
+            const t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (re.test(t)) matched.push(el);
+        }
+        if (matched.length > 1 || (matched.length && !isVisibleEl(matched[0]))) {
+            log('按钮候选', {
+                matched: matched.length,
+                visible: matched.filter(isVisibleEl).length,
+                detail: matched.slice(0, 4).map(e => ({
+                    tag: e.tagName,
+                    cls: String(e.className || '').slice(0, 40),
+                    visible: isVisibleEl(e)
+                }))
+            });
+        }
+        const vis = matched.find(isVisibleEl);
+        return vis || matched[0] || null;
+    }
+
+    // 【local30】本站的 Submit / Retry 都是自绘 div（实测 div.right-button），
+    // 不在 button/.ant-btn/.ly-button 里。按文本全页扫一遍最内层可见节点。
+    function scanByTextExact(re) {
+        const all = document.querySelectorAll('div, button, span, a, i');
+        const hits = [];
+        for (let i = 0; i < all.length && hits.length < 8; i++) {
+            const el = all[i];
+            const t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!re.test(t)) continue;
+            // 只取最内层（子元素里没有同样文本的）
+            let inner = true;
+            for (let k = 0; k < el.children.length; k++) {
+                const ct = String(el.children[k].textContent || '').replace(/\s+/g, ' ').trim();
+                if (ct === t) { inner = false; break; }
+            }
+            if (!inner) continue;
+            hits.push(el);
+        }
+        const vis = hits.filter(isVisibleEl);
+        if (vis.length || hits.length) {
+            log('按钮扫描', {
+                matched: hits.length,
+                visible: vis.length,
+                detail: hits.slice(0, 4).map(e => ({
+                    tag: e.tagName,
+                    cls: String(e.className || '').slice(0, 36),
+                    visible: isVisibleEl(e)
+                }))
+            });
+        }
+        return vis[0] || hits[0] || null;
+    }
+
+    function findSubmitButton(scopeEl) {
+        // 【local35】内容项各有一个 Submit。全局扫会命中隐藏项的按钮 → 点了没反应。
+        const roots = [];
+        if (scopeEl) roots.push(scopeEl);
+        // 本页所有可见的 content-item
+        $('.content-item').forEach(ci => { if (isShownEl(ci)) roots.push(ci); });
+        for (const root of roots) {
+            const els = $('button, div, span, a', root);
+            for (const el of els) {
+                const t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!/^(Submit|提交|提交答案)$/i.test(t)) continue;
+                // 最内层
+                let inner = true;
+                for (const c of el.children) {
+                    if (String(c.textContent || '').replace(/\s+/g, ' ').trim() === t) { inner = false; break; }
+                }
+                if (!inner) continue;
+                if (isShownEl(el)) return el;
+            }
+        }
+        const sc = scanByTextExact(/^(Submit|提交|提交答案)$/i);
+        if (sc && isShownEl(sc)) return sc;
         return null;
     }
-    function findRetryButton() {
-        const btns = $('button.ant-btn, button', $1(SEL.exercisePreview) || document);
-        for (const b of btns) {
-            const t = (b.textContent || '').trim();
-            if (/^Retry$/i.test(t) || /^重做$/.test(t)) return b;
+
+    // 人工点得动、脚本点不动 → 说明脚本拿到的不是同一个节点。
+    // 用户提供的实测 XPath（阅读器里那个真正生效的「重做」）作为最后兜底。
+    const RETRY_XPATH = '/html/body/div[1]/div/div[1]/section/main/div[1]/div/div[3]/div[3]/div/div[4]/div[2]/div/div/div[2]/div[2]';
+
+    function byXPath(xp) {
+        try {
+            const r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            return r && r.singleNodeValue ? r.singleNodeValue : null;
+        } catch (e) { return null; }
+    }
+
+    function looksLikeRetry(el) {
+        if (!el) return false;
+        const t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+        return /^(Retry|重做|重做本题|再做一次|再试一次)$/i.test(t) || /Retry|重做/.test(t);
+    }
+
+    function findRetryButton(scopeEl) {
+        // 【local35】作用域内的按钮优先（多内容项页面里各有一个 Retry）
+        if (scopeEl) {
+            const els = $('button, div, span, a', scopeEl);
+            for (const el of els) {
+                const t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!/^(Retry|重做|重做本题|再做一次|再试一次)$/i.test(t)) continue;
+                let inner = true;
+                for (const c of el.children) {
+                    if (String(c.textContent || '').replace(/\s+/g, ' ').trim() === t) { inner = false; break; }
+                }
+                if (!inner) continue;
+                if (isShownEl(el)) return el;
+            }
         }
+        const sc = scanByTextExact(/^(Retry|重做|重做本题|再做一次|再试一次)$/i);
+        if (sc && isVisibleEl(sc)) return sc;
+        const byText = findClickableByText(/^(Retry|重做|重做本题|再做一次|再试一次)$/i);
+        if (byText && isVisibleEl(byText)) return byText;
+        const xp = byXPath(RETRY_XPATH);
+        if (xp && looksLikeRetry(xp)) {
+            log('重做按钮由 XPath 兜底命中', {
+                tag: xp.tagName,
+                cls: String(xp.className || '').slice(0, 70),
+                text: String(xp.textContent || '').trim().slice(0, 12),
+                visible: isVisibleEl(xp)
+            });
+            return xp;
+        }
+        // 兜底失败时把两边的候选都打出来
+        log('重做按钮定位失败', {
+            byTextFound: !!byText,
+            byTextVisible: byText ? isVisibleEl(byText) : null,
+            xpathFound: !!xp,
+            xpathText: xp ? String(xp.textContent || '').trim().slice(0, 16) : null
+        });
+        // 【local39】绝对不能用 xp 兜底直接返回：实测 XPath 命中过 Submit，
+        // 于是"点重做"变成了"点提交"，页面空着答案就提交上去了。
+        const okText = (el) => {
+            const t = String(el && el.textContent || '').replace(/\s+/g, ' ').trim();
+            return /^(Retry|重做|重做本题|再做一次|再试一次)$/i.test(t) || /Retry|重做/.test(t);
+        };
+        if (byText && okText(byText)) return byText;
+        if (xp && okText(xp)) return xp;
         return null;
     }
 
     // 提交：优先走页面真实按钮（保证站点状态机同步），失败则回退到直接调接口
-    async function submitAnswers() {
-        const btn = findSubmitButton();
+    // 【local56】提交成功 ≠ 服务端记下了。"提交后回查"把 answerStatus 打出来：
+    //   1 = 已判对  2 = 仍判错  其他 = 未知
+    // 这是判断"接口提交到底有没有被采纳"的唯一确凿证据。
+    async function verifyAfterSubmit(questions) {
+        try {
+            await sleep(rnd(1800, 2600));
+            const r = parseReaderRoute();
+            const cid = (r && r.contentId) || CONTENT_ID;
+            if (!cid) return;
+            const resp = await apiGetExercise(cid, r && r.contentType, r && r.bizId, null);
+            const items = (resp && resp.data && resp.data.questionAnswerItemVOList) || [];
+            const digest = (questions || []).slice(0, 4).map(q => {
+                const it = items.find(x => Number(x.questionId) === Number(q.id))
+                    || items.find(x => Number(x.id) === Number(q.id));
+                // 【local60】answerStatus 的语义未确认（2 可能是"判错"也可能是"已判分"），
+                // 用页面上真实的红叉/对勾做交叉验证。
+                let domWrong = 0, domRight = 0;
+                try {
+                    const card = findCardForQuestion(getExerciseItems(), q, 0)
+                        || document.querySelector('[id^="do_' + Number(q.id) + '"]');
+                    const root = (card && card.closest ? card.closest('.exercise-item') : null) || card;
+                    if (root) {
+                        domWrong = root.querySelectorAll('[class*="wrong"], img[src*="wrong"]').length;
+                        domRight = root.querySelectorAll('[class*="right"], [class*="-checked"], img[src*="right"]').length;
+                    }
+                } catch (e) {}
+                return {
+                    qid: Number(q.id),
+                    st: it ? it.answerStatus : null,
+                    hasAns: !!(it && it.answer),
+                    domWrong: domWrong,
+                    domRight: domRight
+                };
+            });
+            log('提交后回查', digest);
+            // 【local59】判"服务端不认"：有回查结果且全部不是 st=1
+            // 判"服务端不认"：既不是 st=1，页面上也没有任何"对"的标记
+            const allWrong = digest.length > 0 && digest.every(d => d.st !== 1 && d.domRight === 0);
+            if (allWrong) {
+                const key = String(cid);
+                const n = (MANUAL_SECTIONS.get(key) || 0) + 1;
+                MANUAL_SECTIONS.set(key, n);
+                if (n >= 2) {
+                    status('本节提交后仍被判错 ' + n + ' 次，标记为需手工处理，跳过');
+                    log('本节需手工', { contentId: cid, attempts: n, lastDigest: digest });
+                    stopRun('本节需手工处理（服务端不接受自动提交），已停止');
+                } else {
+                    status('提交后回查仍判错（' + n + '/2），本轮结束');
+                }
+            } else {
+                MANUAL_SECTIONS.delete(String(cid));
+            }
+        } catch (e) { log('提交后回查异常', String(e).slice(0, 60)); }
+    }
+
+    async function submitAnswers(forceApi) {
+        // 【local35】作用域锁定到本次作答卡片所在的 content-item
+        let scopeEl = null;
+        try {
+            const items = getExerciseItems();
+            if (items.length) scopeEl = visibleContentItem(items[0]);
+        } catch (e) {}
+        // 【local55】forceApi：UI 回填失败时跳过页面按钮，直接提交接口。
+        // 自绘 checkbox 点不动/选中态不可读时，硬点只会提交一份残缺答案。
+        const btn = forceApi ? null : findSubmitButton(scopeEl);
+        log('提交入口', {
+            byButton: !!btn,
+            visible: btn ? isShownEl(btn) : null,
+            scope: scopeEl ? 'content-item' : 'global'
+        });
         if (btn && !btn.disabled) {
-            clickSeq(btn);
-            await sleep(rnd(900, 1500));
+            if (!isVisibleEl(btn)) log('提交按钮不可见，尝试滚动后点击', { cls: String(btn.className || '').slice(0, 40) });
+            realClick(btn, 'submit');
+            log('已点击页面提交按钮', { cls: String(btn.className || '').slice(0, 30) });
+            await sleep(rnd(1200, 1800));
             return true;
         }
+        log('页面无可点提交按钮，转走接口提交');
         // 无按钮（可能未答完/已提交）：尝试直接调接口
         const r = parseReaderRoute();
-        if (!r || !r.contentId || !currentResp) return false;
+        const cid = (r && r.contentId) || CONTENT_ID || null;
+        if (!r || !cid || !currentResp) {
+            log('提交被跳过：路由或 contentId 缺失', { hasRoute: !!r, cid: cid, hasResp: !!currentResp });
+            return false;
+        }
         const qs = currentResp.questionVOList || [];
-        if (!qs.length) return false;
+        if (!qs.length) { log('提交被跳过：当前响应没有题目'); return false; }
         const map = new Map();
         // 优先取 questionVOList 上的 doRecord（包含刚刚填充的作答），再退回 answerItem。
         // 顺序不能反 —— 否则刚填的内容会被服务端的旧值盖掉。
-        (currentResp.questionVOList || []).forEach(q => {
-            const id = Number(q.id);
-            if (q.doRecord !== undefined && q.doRecord !== null && q.doRecord !== '') {
-                map.set(id, q.doRecord);
-                return;
-            }
-            const it = (currentResp.questionAnswerItemVOList || []).find(x => Number(x.questionId) === id);
-            if (it) map.set(id, it.overWriteUserAnswer || it.userAnswer || it.answer || '');
-        });
+        // 【local17】组合题的作答挂在**子题**上，必须递归收集，否则提交时子题的
+        // doRecord 全部丢失（服务端收到空串 → 认为没作答）。
+        const collectAnswers = (list) => {
+            (list || []).forEach(q => {
+                const id = Number(q.id);
+                if (q.doRecord !== undefined && q.doRecord !== null && q.doRecord !== '') {
+                    map.set(id, q.doRecord);
+                } else {
+                    const it = (currentResp.questionAnswerItemVOList || []).find(x => Number(x.questionId) === id);
+                    if (it) map.set(id, it.overWriteUserAnswer || it.userAnswer || it.answer || '');
+                }
+                if (q.children && q.children.length) collectAnswers(q.children);
+            });
+        };
+        collectAnswers(currentResp.questionVOList);
         const questionItemList = flattenForSubmit(qs, map);
-        const payload = { bizId: r.bizId, contentType: r.contentType, catalogId: r.catalogId, contentId: r.contentId, questionItemList };
-        const resp = await apiSubmitAnswer(payload);
-        if (resp && resp.code === 200) {
-            currentResp.questionAnswerItemVOList = resp.data || currentResp.questionAnswerItemVOList;
-            lastAnswerMap = buildAnswerMap(currentResp);
-            await apiMarkContentDone(r.bizId, r.catalogId, r.contentId);
-            return true;
+        const payload = { bizId: r.bizId, contentType: r.contentType, catalogId: r.catalogId, contentId: cid, questionItemList };
+        // 【local13】站点对提交有节流：短时间连续提交会返回「请勿重复提交，请稍后重试」。
+        // 实测该文案下等待数秒后重发即可成功，因此这里做带退避的重试，而不是直接放弃。
+        const DUP_RE = /重复提交|稍后重试|过于频繁|频繁|too\s*(many|fast)|429/i;
+        let resp = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            resp = await apiSubmitAnswer(payload);
+            if (resp && resp.code === 200) {
+                currentResp.questionAnswerItemVOList = resp.data || currentResp.questionAnswerItemVOList;
+                lastAnswerMap = buildAnswerMap(currentResp);
+                await apiMarkContentDone(r.bizId, r.catalogId, cid);
+                log('提交成功（接口）', {
+                    contentId: cid,
+                    items: questionItemList.length,
+                    attempt: attempt + 1
+                });
+                return true;
+            }
+            const msg = resp && resp.message ? String(resp.message) : '';
+            if (!DUP_RE.test(msg)) break;
+            const wait = 5000 + attempt * 4000 + rnd(0, 2000);
+            status('提交被节流（' + msg + '），' + Math.round(wait / 1000) + 's 后重试 ' + (attempt + 1) + '/3');
+            await sleep(wait);
         }
         status('提交失败：' + (resp && resp.message ? resp.message : '未知'));
         return false;
@@ -1645,6 +2796,14 @@ function __TSH_NEW_ENGINE__() {
     // 【闭环要求】拿到答案后**必须再提交一次正确答案**，否则成绩仍是上一次的错误值。
 
     // 给未作答的题填一个"占位答案"，使站点的前端硬门禁（请完成所有习题后再提交）得以通过
+    // 【local29】占位值必须每轮不同，否则服务端把重复提交当同一份作答，
+    // errorNumShow 的计数不增长，标准答案永远不下发。
+    let PLACEHOLDER_ROUND = 0;
+    function placeholderText() {
+        PLACEHOLDER_ROUND++;
+        return 'z' + PLACEHOLDER_ROUND;
+    }
+
     function fillPlaceholder(card, type) {
         try {
             if (type === TYPE.SINGLE || type === TYPE.MULTIPLE || type === TYPE.JUDGE) {
@@ -1652,23 +2811,447 @@ function __TSH_NEW_ENGINE__() {
                 if (!opts.length) return false;
                 return selectOption(opts[0]);
             }
+            // 【本地修复 v2.3.1-local73】judge_advanced（多小题判断）原来没有占位分支：
+            // fillPlaceholder 落到最后的 return false，于是 retryUntilAnswer 第 1819 行
+            // 「仍有无法写入的题」直接 return，一次提交都不发 → 服务端永远累计不到
+            // 答错次数 → 拿不到标准答案 → 该题最终报「未能作答（judge_advanced）」。
+            // 每行 .judge-option-item 各有一套选项，逐行选第一个当占位。
+            if (type === TYPE.JUDGE_HIGH) {
+                const rows = $('.judge-option-item', card);
+                if (rows.length) {
+                    let any = false;
+                    rows.forEach(row => {
+                        const opts = $('.ant-radio-wrapper', row).length ? $('.ant-radio-wrapper', row)
+                            : ($('.option-line', row).length ? $('.option-line', row) : $('label', row));
+                        if (opts[0] && selectOption(opts[0])) any = true;
+                    });
+                    if (any) return true;
+                }
+                // 兜底：结构不是逐行选项时，当成单套选项处理
+                const opts = getOptions(card);
+                if (!opts.length) return false;
+                return selectOption(opts[0]);
+            }
+            // 【local73】拖拽题占位：原来根本没有分支 → 试错时这一题一个字都写不进，
+            // retryUntilAnswer 直接判定"无法写入"返回，一次提交都不发。
+            // 占位策略：把前 N 个可拖项依次丢进前 N 个投放区（只为通过"未作答"检查）。
+            if (type === TYPE.DRAG_ONE || type === TYPE.DRAG_MANY || type === TYPE.DRAG_FILL) {
+                const zones = $('.drop-zone-item-wrapper, [class*="drop-zone"], .blank-placeholder, .inline-answer', card);
+                const srcs = $('[draggable="true"]', card);
+                if (!zones.length || !srcs.length) {
+                    log('拖拽占位缺元素', { zones: zones.length, srcs: srcs.length });
+                    return false;
+                }
+                const n = Math.min(zones.length, srcs.length);
+                let anyDrop = false;
+                for (let i = 0; i < n; i++) {
+                    if (simulateDragDrop(srcs[i], zones[i], srcs[i].getAttribute('data-idx') || srcs[i].textContent || '')) anyDrop = true;
+                }
+                log('拖拽占位', { zones: zones.length, srcs: srcs.length, dropped: n, any: anyDrop });
+                return anyDrop;
+            }
             if (type === TYPE.FILL || type === TYPE.FILL_DIALOG || type === TYPE.FILL_IMAGE ||
                 type === TYPE.FILL_CLOZE || type === TYPE.FILL_CLOZE_MN) {
                 const blanks = $('.zty-exercise-item-fill-blank-do', card);
-                if (blanks.length) { blanks.forEach(b => fillEditable(b, 'a')); return true; }
+                if (blanks.length) { const v = placeholderText(); blanks.forEach(b => fillEditable(b, v)); return true; }
                 const inputs = $('input[type="text"], input:not([type])', card);
-                if (inputs.length) { inputs.forEach(i => fillInput(i, 'a')); return true; }
+                if (inputs.length) { const v2 = placeholderText(); inputs.forEach(i => fillInput(i, v2)); return true; }
                 return false;
             }
             if (AI_ESSAY_TYPES.has(type)) {
                 const ta = $1('textarea', card) || $1('[contenteditable="true"]', card);
-                if (ta) { fillInput(ta, 'a'); return true; }
+                if (ta) { fillInput(ta, placeholderText()); return true; }
                 return false;
             }
             return false;   // 其余题型（拖拽等）无法用占位通过，交由调用方跳过
         } catch (e) {
             return false;
         }
+    }
+
+    // ============================================================================
+    // judge_advanced（多小题判断）专用作答
+    //
+    // 【站点契约，从构建产物反推，2026-11 实测数据核对】
+    //   组件 JudgeMainCourseDo（scopeId data-v-59bf3187）：
+    //     - extension.option[] : 选项图例，{idx, val}
+    //     - extension.topic[]  : 每个小题一句，{idx, text}
+    //     - 每行一个 antd Select（class="answer-select"），value 是**选项 idx**
+    //     - 变更回调：l(topicIdx, optionIdx) → doRecord = [{idx: topicIdx, answer: optionIdx}, …]
+    //   所以：
+    //     1) 不能按 radio 找选项（这类题根本没有 radio，只有下拉框）；
+    //     2) 占位/答案都必须是 [{idx,answer}] 的 JSON 数组，裸串或字符串数组服务端不认。
+    // ============================================================================
+
+    // 逐小题的可作答单元。两种线上变体：
+    //   radio  变体（实测 2026-11，catalogId 10990）：每个 .judge-option-item 是一套
+    //          .ant-radio-group，内含 2 个 input[type=radio]，value 就是 option 的 idx(UUID)
+    //   select 变体（构建产物里的另一种实现）：.question-item 里放 .answer-select 下拉
+    function judgeUnits(card) {
+        const groups = $('.judge-option-item', card).map(el => ({ el, kind: 'radio' }));
+        if (groups.length) return groups;
+        const rows = $('.question-item', card).map(el => ({ el, kind: 'select' }));
+        if (rows.length) return rows;
+        return $('.judge-topic-item', card).map(el => ({ el, kind: 'select' }));
+    }
+
+    // 【实测 2026-11】取题接口下发的 q.extension 是** JSON 字符串**，不是对象。
+    // 直接取 ext.option 会永远是 undefined，导致 option/topic 列表为空、
+    // doRecord 里的 idx 退化成 0..n（服务端不认）。
+    function judgeExt(q) {
+        let e = q && q.extension;
+        if (typeof e === 'string') { try { e = JSON.parse(e); } catch (err) { e = {}; } }
+        return (e && typeof e === 'object') ? e : {};
+    }
+
+    function judgeOptionList(q) {
+        const ext = judgeExt(q);
+        return Array.isArray(ext.option) ? ext.option : [];
+    }
+
+    function judgeTopicList(q) {
+        const ext = judgeExt(q);
+        return Array.isArray(ext.topic) ? ext.topic : [];
+    }
+
+    // 服务端答案 → Map(topicIdx -> optionIdx)；兼容数组字符串与对象数组
+    function parseJudgeHighAnswer(value) {
+        const map = new Map();
+        let v = value;
+        if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { return map; } }
+        if (Array.isArray(v)) {
+            v.forEach((it, i) => {
+                if (it && typeof it === 'object') {
+                    const k = it.idx !== undefined ? String(it.idx) : String(i);
+                    map.set(k, it.answer === undefined ? '' : String(it.answer));
+                } else if (it !== undefined && it !== null) {
+                    map.set(String(i), String(it));
+                }
+            });
+        }
+        return map;
+    }
+
+    // 在一个单元里选中指定选项：radio 变体按 option idx 命中 input，其次按序号；select 变体按下标点下拉项
+    async function fillJudgeUnit(unit, optionIdx, k) {
+        if (!unit) return false;
+        if (unit.kind === 'radio') {
+            let inp = null;
+            if (optionIdx) inp = $1('input[type="radio"][value="' + optionIdx + '"]', unit.el);
+            if (!inp) inp = $('input[type="radio"]', unit.el)[k] || null;
+            if (!inp) return false;
+            const wrap = inp.closest('.ant-radio-wrapper') || inp;
+            clickSeq(wrap);
+            try { inp.click(); } catch (e) {}
+            await sleep(rnd(80, 180));
+            return true;
+        }
+        const sel = $1('.ant-select', unit.el) || $1('.answer-select', unit.el) || $1('.ant-select-selector', unit.el);
+        if (!sel) return false;
+        clickSeq(sel);
+        await sleep(rnd(180, 400));
+        let list = $('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option');
+        if (!list.length) list = $('.ant-select-item-option');
+        const target = list[k];
+        if (!target) {
+            try { document.body.click(); } catch (e) {}
+            return false;
+        }
+        clickSeq(target);
+        await sleep(rnd(150, 300));
+        return true;
+    }
+
+    // 按服务端答案逐行选择
+    async function applyJudgeHigh(card, q, value) {
+        const units = judgeUnits(card);
+        if (!units.length) return false;
+        const topics = judgeTopicList(q);
+        const options = judgeOptionList(q);
+        const desired = parseJudgeHighAnswer(value);
+        let any = false;
+        for (let i = 0; i < units.length; i++) {
+            const topicIdx = topics[i] ? String(topics[i].idx) : null;
+            let optionIdx = topicIdx !== null ? desired.get(topicIdx) : undefined;
+            if (optionIdx === undefined) optionIdx = desired.get(String(i));       // 兜底：按行序
+            if (optionIdx === undefined || optionIdx === '') continue;
+            let k = options.findIndex(o => String(o.idx) === String(optionIdx));
+            if (k < 0) k = 0;
+            if (await fillJudgeUnit(units[i], optionIdx, k)) any = true;
+        }
+        return any;
+    }
+
+    // 占位：每行都选第一个选项（制造"答错一次"，用于触发服务端下发答案）
+    // 组合题（combined_basic / combined_read_comprehension）占位。
+    //
+    // 【实测 2026-11】combined_basic 的父卡片上没有任何可写控件
+    // （fillBlanks/radios/selects 全为 0），真正的作答控件在**子题**里：
+    // 子题各有一张 div.exercise-item[data-child-question-id] 卡片。
+    // 原 fillPlaceholder 没有组合题分支 → 直接返回 false → 整节试错放弃。
+    async function fillCompositePlaceholder(card, q) {
+        const kids = (q && q.children) || [];
+        if (!kids.length) return false;
+
+        // 【local19】组合题常以「已作答态」渲染：填空是 span.-done（含 -done-wrong/-done-right），
+        // 里面根本没有可写元素，于是怎么填都是 0。必须先点「重做」回到 -do 态。
+        // 实测该节 DOM：span.zty-exercise-item-fill-blank-done...-wrong / -right。
+        const doneBlanks = card.querySelectorAll('.zty-exercise-item-fill-blank-done').length;
+        const doBlanks = card.querySelectorAll('.zty-exercise-item-fill-blank-do').length;
+        if (doneBlanks && !doBlanks) {
+            const retry = findRetryButton(visibleContentItem(card));
+            if (retry && !retry.disabled) {
+                log('组合题为查看态，点击重做回到作答态', { doneBlanks, retryText: String(retry.textContent || '').trim().slice(0, 12) });
+                clickSeq(retry);
+                await sleep(rnd(1500, 2500));
+            } else {
+                log('组合题为查看态但没有可点的重做按钮', { doneBlanks, found: !!retry, disabled: retry ? retry.disabled : null });
+            }
+        }
+
+        // 子卡片：线上实测**不带** data-child-question-id，就是嵌在父卡里的 .exercise-item
+        let subCards = $('.exercise-item[data-child-question-id]', card);
+        if (!subCards.length) {
+            subCards = $('.exercise-item', card).filter(el => !el.querySelector('.exercise-item'));
+        }
+        let any = false;
+        for (let i = 0; i < kids.length; i++) {
+            const child = kids[i];
+            if (!child) continue;
+            const target = subCards[i] || card;
+            if (child.type === TYPE.JUDGE_HIGH) {
+                if (await fillJudgeHighPlaceholder(target, child)) {
+                    const enc = encodeJudgeHighFromDom(target, child);
+                    if (enc) { child.doRecord = enc; PLACEHOLDER_IDS.add(Number(child.id)); any = true; }
+                }
+                continue;
+            }
+            if (fillPlaceholder(target, child.type)) {
+                markAnswered(child, 'a', target);
+                PLACEHOLDER_IDS.add(Number(child.id));
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    // 组合题回填：按子题逐个取标准答案写入各自的子卡片。
+    //
+    // 【local31】applyAnswer 没有组合题分支（父卡零可写控件），所以
+    // fillByAnswerMap 对组合题永远 filled=0 → 页面停在占位值 z12/z13。
+    // 【local39】把服务端已下发的标准答案写回页面。返回实际写入的题数。
+    // 判据：有答案 + 该卡在页面上没有"答对"标记。问答题(answerStatus=-1)同样处理，
+    // 因为实测站点对 essay_questions_answers 也会下发 {"annex":[],"answer":"…"}。
+    function cardLooksRight(card) {
+        if (!card) return false;
+        try {
+            const ok = card.querySelectorAll(
+                '[class*="done-right"], [class*="radio-group-right"], [class*="answer-right"], img[src*="right"], img[src*="correct"]'
+            );
+            const bad = card.querySelectorAll('[class*="wrong"], img[src*="wrong"]');
+            return ok.length > 0 && bad.length === 0;
+        } catch (e) { return false; }
+    }
+
+    // 【local45】改成「以页面卡片为准」的回填：
+    // 接口的 questionVOList 有时只有父题、没有 children（子题挂在 answerItem 里），
+    // 按题目树遍历会一条都写不进去。这里直接扫页面卡片，用卡片类名判题型，
+    // 用 answerMap 取该 id 的标准答案。
+    const TYPE_VALUES = Object.keys(TYPE).map(k => TYPE[k]).filter(Boolean);
+
+    function typeFromCard(card) {
+        const cls = String((card && card.className) || '');
+        for (const v of TYPE_VALUES) {
+            if (v && cls.indexOf(v) >= 0) return v;
+        }
+        try { return detectType(card); } catch (e) { return ''; }
+    }
+
+    function cardIdOf(card) {
+        if (!card || !card.dataset) return 0;
+        const v = card.dataset.childQuestionId || card.dataset.questionId ||
+            card.getAttribute('data-child-question-id') || card.getAttribute('data-question-id');
+        const n = Number(v);
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    async function fillFromStandardAnswers(questions) {
+        // 【local40】查看态（readonly-answer）没有可写控件：先点 Retry 回到作答态
+        let items = getExerciseItems();
+        try {
+            if (items.length && !firstEditableControl()) {
+                const ok = await ensureEditableState(items[0]);
+                if (ok) {
+                    await sleep(rnd(600, 1000));
+                    items = getExerciseItems();
+                } else {
+                    log('回填前无法进入作答态（可能已是查看态且无 Retry）');
+                }
+            }
+        } catch (e) {}
+
+        const allCards = [];
+        items.forEach(c => {
+            allCards.push(c);
+            try {
+                c.querySelectorAll('.exercise-item[data-child-question-id]').forEach(x => allCards.push(x));
+            } catch (e) {}
+        });
+
+        log('回填扫描', {
+            cards: allCards.length,
+            withId: allCards.filter(c => cardIdOf(c) > 0).length,
+            answers: lastAnswerMap.size,
+            editable: !!firstEditableControl()
+        });
+        let filled = 0;
+        for (const card of allCards) {
+            const id = cardIdOf(card);
+            if (!id) continue;
+            const a = lastAnswerMap.get(id);
+            let raw = (a && a.answer !== undefined && a.answer !== null && a.answer !== '') ? a.answer : null;
+            if (raw === null) {
+                const q = (questions || []).find(x => Number(x.id) === id);
+                if (q && q.answer) raw = q.answer;
+            }
+            if (raw === null || raw === '') continue;
+
+            const type = typeFromCard(card);
+            const textual = AI_FILL_TYPES.has(type) || AI_ESSAY_TYPES.has(type);
+            const fillable = textual || type === TYPE.SINGLE || type === TYPE.MULTI ||
+                type === TYPE.JUDGE || type === TYPE.JUDGE_HIGH;
+            if (!fillable) continue;
+            if (cardLooksRight(card)) continue;
+
+            const value = textual ? normalizeFillAnswer(raw) : decodeAnswer(raw, type);
+            if (value === null || value === undefined || value === '') continue;
+            const ok = (type === TYPE.JUDGE_HIGH)
+                ? await applyJudgeHigh(card, findQuestionById(questions, id) || {}, value)
+                : (type === TYPE.MULTIPLE
+                    ? await fillMultipleChoice(card, value)
+                    : (type === TYPE.SINGLE ? await fillSingleChoice(card, value) : applyAnswer(card, type, value)));
+            if (ok) {
+                const q = findQuestionById(questions, id) || { id: id, type: type };
+                markAnswered(q, value, card);
+                filled++;
+                log('标准答案回填', { id: id, type: type, preview: String(JSON.stringify(value)).slice(0, 46) });
+            }
+            await sleep(rnd(100, 200));
+        }
+        return filled;
+    }
+
+    function findQuestionById(questions, id) {
+        let hit = null;
+        const walk = (arr) => (arr || []).forEach(q => {
+            if (hit) return;
+            if (Number(q.id) === Number(id)) { hit = q; return; }
+            if (q.children && q.children.length) walk(q.children);
+        });
+        walk(questions);
+        return hit;
+    }
+
+    async function applyCompositeAnswers(card, q) {
+        const kids = (q && q.children) || [];
+        if (!kids.length) return 0;
+        const subCards = $('.exercise-item[data-child-question-id]', card);
+        // 父题答案可能是「按子题 id 组织的映射」，先解出来备用
+        let parentMap = null;
+        try {
+            const pa = lastAnswerMap.get(Number(q.id));
+            if (pa && pa.answer) {
+                const parsed = typeof pa.answer === 'string' ? JSON.parse(pa.answer) : pa.answer;
+                if (Array.isArray(parsed)) {
+                    parentMap = new Map();
+                    parsed.forEach(it => {
+                        if (it && it.idx !== undefined) parentMap.set(String(it.idx), it.answer !== undefined ? it.answer : it);
+                    });
+                } else if (parsed && typeof parsed === 'object') {
+                    parentMap = new Map(Object.keys(parsed).map(k => [String(k), parsed[k]]));
+                }
+            }
+        } catch (e) {}
+
+        let filled = 0;
+        for (let i = 0; i < kids.length; i++) {
+            const child = kids[i];
+            if (!child) continue;
+            const target = subCards[i] || card;
+            let raw;
+            const ca = lastAnswerMap.get(Number(child.id));
+            if (ca && ca.answer !== undefined && ca.answer !== null && ca.answer !== '') raw = ca.answer;
+            else if (child.answer !== undefined && child.answer !== null && child.answer !== '') raw = child.answer;
+            else if (parentMap && parentMap.has(String(child.id))) raw = parentMap.get(String(child.id));
+            log('子题答案', {
+                childId: Number(child.id),
+                type: child.type,
+                gotAnswer: raw !== undefined && raw !== null && raw !== '',
+                preview: String(raw === undefined ? '' : JSON.stringify(raw)).slice(0, 60)
+            });
+            if (raw === undefined || raw === null || raw === '') continue;
+
+            const type = child.type || detectType(target);
+            // 【local42】essay_questions_answers 之类的文本题也必须走 normalizeFillAnswer：
+            // 标准答案是 {"annex":[],"answer":"…"}，用 decodeAnswer 会原样塞 JSON 进输入框，
+            // 校验失败 → filled 恒为 0。
+            const value = (AI_FILL_TYPES.has(type) || AI_ESSAY_TYPES.has(type))
+                ? normalizeFillAnswer(raw)
+                : decodeAnswer(raw, type);
+            if (value === null || value === undefined) continue;
+            const ok = (type === TYPE.JUDGE_HIGH)
+                ? await applyJudgeHigh(target, child, value)
+                : (type === TYPE.MULTIPLE
+                    ? await fillMultipleChoice(target, value)
+                    : (type === TYPE.SINGLE ? await fillSingleChoice(target, value) : applyAnswer(target, type, value)));
+            if (ok) { markAnswered(child, value, target); filled++; }
+            await sleep(rnd(120, 240));
+        }
+        return filled;
+    }
+
+    async function fillJudgeHighPlaceholder(card, q) {
+        const units = judgeUnits(card);
+        if (!units.length) return false;
+        const first = judgeOptionList(q)[0];
+        const firstIdx = first ? String(first.idx) : '';
+        let any = false;
+        for (const u of units) {
+            if (await fillJudgeUnit(u, firstIdx, 0)) any = true;
+        }
+        return any;
+    }
+
+    // 从 DOM 当前选中态编码 doRecord：[{idx: topicIdx, answer: optionIdx}, …]
+    function encodeJudgeHighFromDom(card, q) {
+        const units = judgeUnits(card);
+        if (!units.length) return '';
+        const topics = judgeTopicList(q);
+        const options = judgeOptionList(q);
+        const norm = s => String(s == null ? '' : s).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+        const arr = [];
+        units.forEach((u, i) => {
+            let ans = '';
+            if (u.kind === 'radio') {
+                const inp = $1('input[type="radio"]:checked', u.el);
+                if (inp) ans = String(inp.value);
+            } else {
+                const sel = $1('.ant-select-selection-item', u.el)
+                    || $1('.ant-select-selection-selected-value', u.el);
+                const text = sel ? norm(sel.textContent) : '';
+                if (text) {
+                    const hit = options.find(o => {
+                        const v = norm(o.val);
+                        const txt = norm(o.text);
+                        return (v && text.indexOf(v) >= 0) || (txt && text.indexOf(txt) >= 0);
+                    });
+                    if (hit) ans = String(hit.idx);
+                }
+            }
+            if (!ans) return;
+            arr.push({ idx: topics[i] ? topics[i].idx : i, answer: ans });
+        });
+        return arr.length ? JSON.stringify(arr) : '';
     }
 
     // 确保题目处于「作答态」。
@@ -1678,19 +3261,142 @@ function __TSH_NEW_ENGINE__() {
     // 查看态下题卡没有可写的作答元素，直接填答案会「写入 0 个空」而静默失败，
     // 随后提交的仍是上一轮的旧答案 —— 表现为「拿到了服务端标准答案却拿不到分」。
     // 必须先点 Retry 回到作答态。
-    async function ensureEditableState() {
-        if ($1('.zty-exercise-item-fill-blank-do, .ant-radio-wrapper, .option-content, .drag-drop-container')) {
-            return true;                       // 已有可写作答元素
+    // 可写入的作答元素（排除 disabled / antd 的 -disabled 变体）
+    //
+    // 【实测 2026-11，catalogId 10988 判分后页面】已提交的节里，input[type=radio]
+    // 全部带 disabled，wrapper 上有 ant-radio-wrapper-disabled。原来的实现只判断
+    // "元素是否存在"，于是把查看态当可写态，回填时点了 0 个反被当成成功。
+    // 【local39】问答题的可写控件是 textarea，原来不在选择器里 →
+    // firstEditableControl() 永远返回 null，被误判成"无法进入作答态"。
+    const EDITABLE_SEL = '.zty-exercise-item-fill-blank-do, [contenteditable="true"], .ant-radio-wrapper, ' +
+        '.option-content, .drag-drop-container, .answer-select, .ant-select, ' +
+        'textarea:not([disabled]):not([readonly]), input[type="text"]:not([disabled]):not([readonly])';
+
+    // 【local53】必须支持作用域：整页找会把**别的卡片**的控件当成"本节可写"，
+    // 于是判"已进入作答态"，而当前这张卡的 checkbox 其实还是 disabled。
+    function firstEditableControl(scopeEl) {
+        const list = scopeEl ? $(EDITABLE_SEL, scopeEl) : $(EDITABLE_SEL);
+        for (let i = 0; i < list.length; i++) {
+            const el = list[i];
+            if (!el || el.disabled) continue;
+            const inp = el.tagName === 'INPUT' ? el : (el.querySelector ? el.querySelector('input') : null);
+            // 【local50】类名里的 disabled 不可信：站点在作答态有时仍保留
+            // ant-checkbox-wrapper-disabled 之类的类名，于是"页面明明能答"却被判不可写。
+            // 只有内部 input 真的 disabled（或根本没有 input 可查）才算不可写。
+            const clsDisabled = String(el.className || '').indexOf('disabled') >= 0;
+            if (clsDisabled && (!inp || inp.disabled)) continue;
+            if (inp && inp.disabled) continue;
+            return el;
         }
-        const retry = findRetryButton();
-        if (!retry || retry.disabled) return false;
-        clickSeq(retry);
-        await sleep(rnd(1500, 2600));
-        return !!$1('.zty-exercise-item-fill-blank-do, .ant-radio-wrapper, .option-content, .drag-drop-container');
+        return null;
     }
 
-    // 循环：填占位 → 提交 → 重新取题 → 直到服务端下发答案 → 填正确答案 → 再提交一次
-    async function retryUntilAnswer(route, questions, threshold) {
+    // 【local50】"重做"在同一页可能有多个节点：div.right-button 里的 span、看不见的
+    // antd <button>、XPath 命中的那个……**点哪个生效不固定**（实测 span 按坐标点无效，
+    // 而 rect=[0,0] 的 antd button 用原生 click() 反而生效）。
+    // 因此不再"选一个点了就算了"，而是把所有候选轮流试，每次点完都验证能否写入。
+    function collectRetryCandidates(scopeEl) {
+        const RE = /^(Retry|重做|重做本题|再做一次|再试一次)$/i;
+        const out = [];
+        const push = (el) => { if (el && out.indexOf(el) < 0) out.push(el); };
+        const scanIn = (root) => {
+            if (!root) return;
+            const els = $('button, div, span, a', root);
+            for (const el of els) {
+                const t = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!RE.test(t)) continue;
+                let inner = true;
+                for (const c of el.children) {
+                    if (String(c.textContent || '').replace(/\s+/g, ' ').trim() === t) { inner = false; break; }
+                }
+                if (inner) push(el);
+            }
+        };
+        scanIn(scopeEl);
+        $('.content-item').forEach(ci => { if (isShownEl(ci)) scanIn(ci); });
+        scanIn(document);
+        const xp = byXPath(RETRY_XPATH);
+        if (xp && looksLikeRetry(xp)) push(xp);
+        // 可见的排前面
+        return out.filter(el => isShownEl(el)).concat(out.filter(el => !isShownEl(el)));
+    }
+
+    async function ensureEditableState(scopeEl) {
+        if (!scopeEl) {
+            try {
+                const items2 = getExerciseItems();
+                if (items2.length) scopeEl = visibleContentItem(items2[0]);
+            } catch (e) {}
+        }
+        if (firstEditableControl(scopeEl)) return true;
+
+        const cands = collectRetryCandidates(scopeEl);
+        log('重做候选', {
+            n: cands.length,
+            detail: cands.slice(0, 4).map(el => ({
+                tag: el.tagName,
+                cls: String(el.className || '').slice(0, 26),
+                shown: isShownEl(el),
+                text: String(el.textContent || '').trim().slice(0, 8)
+            }))
+        });
+
+        for (let i = 0; i < cands.length && i < 4; i++) {
+            const el = cands[i];
+            // 1) 按坐标点最顶层元素
+            realClick(el, 'retry#' + i);
+            await sleep(1400);
+            if (firstEditableControl(scopeEl)) {
+                log('已进入作答态', { via: 'realClick', idx: i });
+                return true;
+            }
+            // 2) 原生 click（对不可见的 antd button 有效）
+            try { el.click(); } catch (e) {}
+            await sleep(1400);
+            if (firstEditableControl(scopeEl)) {
+                log('已进入作答态', { via: 'nativeClick', idx: i });
+                return true;
+            }
+        }
+
+        // 【local54】三级判定：作用域认错卡时不要把"整页可写"也否掉。
+        // 实测 {inCard:0, inPage:1, disabledInputs:0, radios:14, checks:12, textareas:4}：
+        // 页面明明是可写状态，只是 items[0] 落在别的内容项上。
+        // 【local64】不能用"存在任何 disabled input"来否定整页可写：
+        // 实测 22 个输入框里只有 1 个 disabled（常是无关的隐藏 input / 音频控件），
+        // 却因此把整节判成不可写 → 直接跳过。改成数"真正可用的控件"。
+        const enabledChecks = $('.ant-checkbox-wrapper:not(.ant-checkbox-wrapper-disabled)').length;
+        const enabledRadios = $('.ant-radio-wrapper:not(.ant-radio-wrapper-disabled)').length;
+        const enabledAreas = $('textarea:not([disabled])').length;
+        const enabledTotal = enabledChecks + enabledRadios + enabledAreas;
+        const inPage = !!firstEditableControl();
+        log('作答态探测', {
+            inCard: firstEditableControl(scopeEl) ? 1 : 0,
+            inPage: inPage ? 1 : 0,
+            enabledChecks: enabledChecks,
+            enabledRadios: enabledRadios,
+            enabledAreas: enabledAreas,
+            disabledInputs: $('input[disabled]').length,
+            totalInputs: $('input').length,
+            scope: scopeEl ? String(scopeEl.className || '').slice(0, 30) : 'none'
+        });
+        if (inPage || enabledTotal > 0) {
+            log('按整页判定可写', { enabledTotal: enabledTotal });
+            return true;
+        }
+        log('点击重做后仍无可写元素', {
+            doneBlanks: $('.zty-exercise-item-fill-blank-done').length,
+            doBlanks: $('.zty-exercise-item-fill-blank-do').length,
+            ctAny: $('[contenteditable]').length,
+            radios: $('.ant-radio-wrapper:not(.ant-radio-wrapper-disabled)').length,
+            checks: $('.ant-checkbox-wrapper:not(.ant-checkbox-wrapper-disabled)').length,
+            textareas: $('textarea:not([disabled])').length,
+            tried: Math.min(cands.length, 4)
+        });
+        return false;
+    }
+
+    async function retryUntilAnswer(route, questions, threshold, forceRewrite) {
         if (!Number.isFinite(threshold)) return false;
         const maxCalls = threshold + 3;
 
@@ -1717,6 +3423,7 @@ function __TSH_NEW_ENGINE__() {
             // 实测（同节 1 客观 + 1 主观）：取题 7 次、提交 6 次、24.6 秒、返回 false；
             // 而全客观的对照只需要 2 次提交、7 秒、返回 true。
             const expectAnswer = (q) => {
+                if (q.type && KNOWN_OBJECTIVE_TYPES.has(q.type)) return true;  // 客观题必须期望答案下发
                 const a = map.get(Number(q.id));
                 if (gradedKindOf(a) === 'subjective') return false;   // 行为证据优先
                 if (!a && isSubjective(q)) return false;              // 尚无返回，按标签判断
@@ -1726,27 +3433,50 @@ function __TSH_NEW_ENGINE__() {
             // "答案可用"= 有答案，且填空题的答案能真正摊平成每空一项。
             // 注意：主观填空可能下发 "Answers will vary."，非空但无法作答，
             // 只看非空会误判为"已齐"从而卡住。
+            // 【local32】组合题的标准答案按**子题**下发（父题 answer 恒为空），
+            // 原来只看父题 → 永远判定"答案未齐" → 死循环占位试错。
+            const childAnswerOf = (child) => {
+                if (!child) return null;
+                const ca = map.get(Number(child.id));
+                if (ca && ca.answer !== undefined && ca.answer !== null && ca.answer !== '') return ca.answer;
+                if (child.answer !== undefined && child.answer !== null && child.answer !== '') return child.answer;
+                return null;
+            };
             const usable = (q) => {
+                if (q.children && q.children.length) {
+                    return q.children.every(c => !!childAnswerOf(c));
+                }
                 const a = map.get(Number(q.id));
-                if (!a || !a.answer) return false;
-                if (AI_FILL_TYPES.has(q.type)) return normalizeFillAnswer(a.answer) !== null;
-                return true;
+                if (a && a.answer !== undefined && a.answer !== null && a.answer !== '') {
+                    return AI_FILL_TYPES.has(q.type) ? normalizeFillAnswer(a.answer) !== null : true;
+                }
+                if (q.answer !== undefined && q.answer !== null && q.answer !== '') {
+                    return true;
+                }
+                return false;
             };
             const missing = questions.filter(q => expectAnswer(q) && !usable(q));
 
             if (!missing.length) {
                 // 答案已齐 → 先回到作答态（查看态下无法写入），再填入并提交
-                if (!(await ensureEditableState())) {
-                    log('无法进入作答态，放弃回填');
-                    return false;
+                if (await ensureEditableState()) {
+                    const r = await fillByAnswerMap();
+                    log('试错取得答案，回填', r);
+                    if (r.filled) {
+                        await sleep(rnd(400, 800));
+                        // 【local15】部分题没填上也不再整体放弃：能提交的先提交
+                        const rest = questions.filter(q => !hasUserAnswer(q));
+                        if (rest.length) log('部分题未填上（仍提交已作答部分）', rest.map(q => ({ id: q.id, type: q.type })));
+                        await submitAnswers();
+                        return true;
+                    }
+                    // 【local12】答案条目看着有、实际填不进去（空串/格式不认）
+                    // 不再直接 return false，而是继续走下面的**占位 + 提交**流程，
+                    // 让服务端累计答错次数，从而真正拿到答案。
+                    log('回填未写入任何答案，转入占位试错');
+                } else {
+                    log('无法进入作答态，转入占位试错');
                 }
-                const r = await fillByAnswerMap();
-                log('试错取得答案，回填', r);
-                if (!r.filled) return false;
-                await sleep(rnd(400, 800));
-                if (questions.filter(q => !hasUserAnswer(q)).length) return false;
-                await submitAnswers();
-                return true;
             }
 
             // 尚未下发答案 → 只为**真正没作答的**题补占位，然后提交以累计作答次数。
@@ -1755,14 +3485,76 @@ function __TSH_NEW_ENGINE__() {
             // 只补空位，其余保持原样，这样每轮提交都保住当前最好结果。
             // 注意：AI 已填满时没有空位可补，但**仍然要提交**才能累计次数，
             // 因此这里不能用"是否补了占位"作为继续条件。
+            if (forceRewrite) {
+                if (!(await ensureEditableState())) {
+                    log('重做模式下无法进入作答态，终止试错');
+                    return false;
+                }
+            }
             const items = getExerciseItems();
-            questions.forEach((q, i) => {
-                if (hasUserAnswer(q)) return;                    // 已作答（含 AI 刚填的）→ 不动
-                const card = items.find(c => c.dataset && Number(c.dataset.questionId) === Number(q.id)) || items[i];
-                if (card && fillPlaceholder(card, q.type)) markAnswered(q, 'a', card);
-            });
+            let wroteAny = 0;
+            const unfillable = [];
+            for (let i = 0; i < questions.length; i++) {
+                const q = questions[i];
+                // forceRewrite：错题重做场景。服务端认为"已作答"（answerStatus=3），
+                // 但页面上是判错态，必须强制覆盖写入**不同的**占位值才能累计答错次数。
+                if (hasUserAnswer(q) && !forceRewrite) { wroteAny++; continue; }
+                const card = findCardForQuestion(items, q, i);
+                if (!card) { unfillable.push({ id: q.id, type: q.type, why: 'no-card' }); continue; }
+                // 组合题：正确答案在子题里，逐个子题填
+                if (q.children && q.children.length) {
+                    if (await fillCompositePlaceholder(card, q)) {
+                        wroteAny++;
+                    } else {
+                        unfillable.push({
+                            id: q.id, type: q.type, why: 'composite-fill-failed',
+                            children: q.children.length,
+                            subCards: card.querySelectorAll('.exercise-item[data-child-question-id]').length,
+                            controlsTotal: card.querySelectorAll('input,select,textarea,[contenteditable]').length
+                        });
+                    }
+                    continue;
+                }
+                // judge_advanced 走下拉框专用的占位逻辑（没有 radio 可点）
+                if (q.type === TYPE.JUDGE_HIGH) {
+                    if (await fillJudgeHighPlaceholder(card, q)) {
+                        const enc = encodeJudgeHighFromDom(card, q);
+                        if (enc) { q.doRecord = enc; PLACEHOLDER_IDS.add(Number(q.id)); }
+                        else markAnsweredFromDom(q, card);
+                        wroteAny++;
+                    } else {
+                        unfillable.push({ id: q.id, type: q.type, why: 'judge-fill-failed' });
+                    }
+                    continue;
+                }
+                if (fillPlaceholder(card, q.type)) {
+                    markAnsweredFromDom(q, card);
+                    wroteAny++;
+                } else {
+                    // 【local15】把"为什么写不进去"记下来：卡片类名 + 命中的可写控件数
+                    unfillable.push({
+                        id: q.id,
+                        type: q.type,
+                        why: 'fill-failed',
+                        cardCls: String(card.className || '').slice(0, 50),
+                        fillBlanks: card.querySelectorAll('.zty-exercise-item-fill-blank-do').length,
+                        radios: card.querySelectorAll('.ant-radio-wrapper, input[type=radio]').length,
+                        selects: card.querySelectorAll('.ant-select').length,
+                        ctEditable: card.querySelectorAll('[contenteditable]').length,
+                        controlsTotal: card.querySelectorAll('input,select,textarea,[contenteditable]').length
+                    });
+                }
+            }
             if (!items.length) return false;
-            if (questions.some(q => !hasUserAnswer(q))) return false;   // 仍有无法写入的题
+            // 【local15】只要求"至少有一题能写入"，不再要求全部可写。
+            // 原来只要有一题填不进去（例如答案在卡片外、或拖拽类无输入控件），
+            // 整个试错循环立刻 return false —— 一次提交都不发，表现为
+            // 「跑了三轮、页面一个字没变、然后跳到下一节」。
+            if (!wroteAny) {
+                log('本节没有任何题能写入占位，放弃试错', unfillable);
+                return false;
+            }
+            if (unfillable.length) log('这些题写不进占位（跳过，其余照常提交）', unfillable);
 
             await sleep(rnd(600, 1200));                          // 节流：站点无退避，必须自控节奏
             const ok = await submitAnswers();
@@ -2136,8 +3928,17 @@ function __TSH_NEW_ENGINE__() {
             st.stuck = 0;
             setAutoRun(st);
         }
-        status('自动刷课 → 下一节：' + String(next.title).slice(0, 18)
-            + '（已处理 ' + doneSet.size + ' 项，剩余待刷）');
+        // 【local14】整页跳转是"自动刷新"观感的来源。加计数上限，避免无人值守时无限跳。
+        st.jumps = (st.jumps || 0) + 1;
+        if (st.jumps > 300) {
+            setAutoRun(null);
+            status('自动刷课：已跳转 ' + st.jumps + ' 次，为防止无限刷新已自动停止');
+            stopRun('跳转次数超限');
+            return false;
+        }
+        setAutoRun(st);
+        status('自动刷课 → 第 ' + st.jumps + ' 次跳转：' + String(next.title).slice(0, 18)
+            + '（已处理 ' + doneSet.size + ' 项，剩余待刷；点「停止」可中断）');
         await sleep(rnd(600, 1000));
         gotoContent(courseId, next.catalogId, next.contentId);
         return true;
@@ -2150,7 +3951,7 @@ function __TSH_NEW_ENGINE__() {
             status('未能确定课程：请进入课程内页，或在面板「课程」下拉中选择一门');
             return false;
         }
-        const st = { active: true, courseId: courseId, done: [], stuck: 0 };
+        const st = { active: true, courseId: courseId, done: [], stuck: 0, jumps: 0 };
         // 记录当前已处理的节，避免重复
         const r = parseReaderRoute();
         if (r && r.contentId) st.done.push(String(r.contentId));
@@ -2442,6 +4243,9 @@ function __TSH_NEW_ENGINE__() {
     let timer = null;
     let roundCount = 0;
     let noProgressRounds = 0;
+    let wrongRedoFails = 0;
+    // 【local59】提交了但服务端不认的节：连续 2 次就标记为需手工，避免无限重试
+    const MANUAL_SECTIONS = new Map();      // 【local36】同一节连续重做仍未取得答案的次数
     let invalidRounds = 0;
     let statusEl = null;
     const MAX_ROUNDS = 500;
@@ -2501,12 +4305,108 @@ function __TSH_NEW_ENGINE__() {
         }
 
         const questions = data.questionVOList || [];
+
+        // 【local70】整节都是判断题 → 放在所有分支之前处理。
+        // 之前放在"未答完/已全部作答"分支里，都被前面的路径抢走（judge_advanced 的
+        // doRecord 是 JSON 数组，hasUserAnswer 判成未作答 → 直接进试错轮询）。
+        // 判断题只有对/错两态，是最不该跑 6 轮试错的题型。
+        try {
+            const JT = [TYPE.JUDGE, TYPE.JUDGE_HIGH];
+            const allJudge = questions.length > 0 && questions.every(q => JT.indexOf(q.type) >= 0);
+            if (allJudge && getExerciseItems().length) {
+                const amapA = buildAnswerMap(currentResp || data);
+                const wrongQs = questions.filter(q => {
+                    const a = amapA.get(Number(q.id));
+                    const st = a ? Number(a.status) : Number(q.answerStatus);
+                    return st === 2;
+                });
+                const domWrong = $('[class*="wrong"], img[src*="wrong"]').length;
+                if (wrongQs.length || domWrong > 0) {
+                    status('整节判断题（' + questions.length + ' 题，答错 ' + wrongQs.length + '）→ 逐行纠正后提交');
+                    const cardOf = (q) => findCardForQuestion(getExerciseItems(), q, 0) || getExerciseItems()[0] || null;
+                    let apiFlipUsed = false;
+                    if (await ensureEditableState()) {
+                        let fixedA = 0;
+                        for (const q of questions) {
+                            const a = amapA.get(Number(q.id));
+                            const card = findCardForQuestion(getExerciseItems(), q, 0);
+                            if (!card) continue;
+                            let done = false;
+                            if (a && a.answer) {
+                                const val = decodeAnswer(a.answer, q.type);
+                                done = await fillSingleChoice(card, val);
+                                if (!done) done = applyAnswer(card, q.type, val);
+                                if (done) markAnswered(q, val, card);
+                                log('判断题按标准答案纠正', { id: q.id, ok: done });
+                            }
+                            if (!done) {
+                                // 【local71】先算答案走接口（不依赖点击），失败再退回 DOM 点击
+                                const flipped = computeFlippedAnswer(card, q);
+                                if (flipped !== undefined) {
+                                    markAnswered(q, flipped, card);
+                                    done = true;
+                                    apiFlipUsed = true;
+                                    log('接口取反', { id: q.id, val: String(JSON.stringify(flipped)).slice(0, 60) });
+                                } else {
+                                    const rows = await flipJudgeRows(card);
+                                    if (rows) { done = true; markAnswered(q, 'flip' + rows, card); }
+                                    else done = await flipJudgeAnswer(card, q);
+                                }
+                            }
+                            if (done) fixedA++;
+                        }
+                        if (fixedA) {
+                            await sleep(rnd(400, 800));
+                            await submitAnswers(apiFlipUsed);
+                            await verifyAfterSubmit(questions);
+                            // 【local72】取反后仍判错 → 穷举（2^n 种组合，判对即停）
+                            let solvedAll = true;
+                            for (const q of questions) {
+                                const card2 = findCardForQuestion(getExerciseItems(), q, 0) || cardOf(q);
+                                const stNow = await readQuestionStatus(q.id);
+                                if (stNow && stNow.st === 1) continue;
+                                solvedAll = false;
+                                if (!card2) continue;
+                                const solved = await bruteForceJudge(q, card2);
+                                log('判断题穷举结果', { id: q.id, solved: solved });
+                                if (solved) solvedAll = true;
+                            }
+                            noProgressRounds = 0;
+                            return;
+                        }
+                        status('判断题纠正失败，继续常规流程');
+                    } else {
+                        status('判断题纠正前无法进入作答态，继续常规流程');
+                    }
+                }
+            }
+        } catch (e) { log('判断题快路异常', String(e).slice(0, 60)); }
+
         if (questions.length) {
-            // 语音评测题需真实录音，无法自动作答 —— 明确告知并跳过，避免误判为脚本故障
-            const speechCards = getExerciseItems().filter(cardNeedsSpeech);
+            // 语音评测题需真实录音，无法自动作答 —— 但不因此跳过整节。
+            //
+            // 【本地修复 v2.3.1-local73】站点并没有"整节答完才能提交"的硬门禁：
+            // 全量前端产物里搜不到「请完成所有习题」这类文案（0 命中），
+            // 而 submitAnswers() 在按钮 disabled 时会直接调提交接口，
+            // 也就是说部分作答是可以提交的。因此只在这两种情况下跳过：
+            //   a) 整节所有题卡都是语音题（没有可作答的东西）
+            //   b) 服务端真的拒绝提交（由路径 B 处理）
+            // 其余情况照常作答并提交，让语音题留空。
+            const allCards = getExerciseItems();
+            const speechCards = allCards.filter(cardNeedsSpeech);
+            const allSpeech = allCards.length > 0 && speechCards.length === allCards.length;
             if (speechCards.length) {
-                status('本节含 ' + speechCards.length + ' 道语音题（需真人录音），无法自动作答，直接跳过');
-                log('语音题卡片', speechCards);
+                log('语音题卡片', {
+                    cards: allCards.length,
+                    speechCards: speechCards.length,
+                    questions: questions.length,
+                    allSpeech
+                });
+                // 逐张打印判定依据：hasAnswerable=true、或 hasRecControl=false 时高度可疑是误判
+                speechCards.forEach((c, i) => log('语音判定 #' + (i + 1), speechDiagnosis(c)));
+            }
+            if (allSpeech) {
+                status('本节 ' + allCards.length + ' 个题卡全部是语音题（需真人录音），整节跳过');
                 await sleep(rnd(600, 1000));
                 // 标记内容完成并尝试翻页，让用户自行处理语音题
                 if (route.catalogId) await apiMarkContentDone(route.bizId, route.catalogId, route.contentId || 0);
@@ -2516,6 +4416,10 @@ function __TSH_NEW_ENGINE__() {
                     if (noProgressRounds >= 3) { noProgressRounds = 0; stopRun('遇到语音题且无法翻页，已停止'); }
                 } else { noProgressRounds = 0; }
                 return;
+            }
+            if (speechCards.length) {
+                status('本节有 ' + speechCards.length + ' 个语音题卡（需真人录音）将留空，'
+                    + '其余 ' + (allCards.length - speechCards.length) + ' 个正常作答并提交');
             }
 
             // 判定是否已全部作答
@@ -2537,6 +4441,47 @@ function __TSH_NEW_ENGINE__() {
                 // 比 AI 更准（实测同一题 AI 五空全错、轮询得到的全对），且零 token 成本。
                 // 主观题才是 AI 唯一必要的场景 —— 服务端对它们不下发答案。
                 let left = questions.filter(q => !hasUserAnswer(q));
+
+                // 【local69】判断题专项：只要"待作答"的题全是判断题，就直接纠正一次提交。
+                // 之前这段放在"已全部作答"分支里，但 judge_advanced 的 doRecord 是 JSON 数组，
+                // hasUserAnswer() 判成未作答 → 整节直接进试错轮询，专用路径永远轮不到。
+                // 判断题只有对/错两态，是最省时的一种题，值得单独一条快路。
+                const JUDGE_FAST = [TYPE.JUDGE, TYPE.JUDGE_HIGH];
+                const judgeLeft = left.filter(q => JUDGE_FAST.indexOf(q.type) >= 0);
+                if (judgeLeft.length && judgeLeft.length === left.length) {
+                    status('待作答的都是判断题（' + judgeLeft.length + ' 题），直接纠正后提交一次');
+                    const amapJ = buildAnswerMap(currentResp);
+                    if (await ensureEditableState()) {
+                        const itemsJ = getExerciseItems();
+                        let fixedJ = 0;
+                        for (const q of judgeLeft) {
+                            const a = amapJ.get(Number(q.id));
+                            const card = findCardForQuestion(itemsJ, q, 0);
+                            if (!card) continue;
+                            let done = false;
+                            if (a && a.answer) {
+                                const val = decodeAnswer(a.answer, q.type);
+                                done = await fillSingleChoice(card, val);
+                                if (!done) done = applyAnswer(card, q.type, val);
+                                if (done) markAnswered(q, val, card);
+                                log('判断题按标准答案纠正', { id: q.id, ok: done });
+                            }
+                            if (!done) done = await flipJudgeAnswer(card, q);
+                            if (done) fixedJ++;
+                        }
+                        if (fixedJ) {
+                            await sleep(rnd(400, 800));
+                            await submitAnswers();
+                            await verifyAfterSubmit(judgeLeft);
+                            noProgressRounds = 0;
+                            return;
+                        }
+                        status('判断题纠正失败，回退到通用流程');
+                    } else {
+                        status('判断题纠正前无法进入作答态，回退到通用流程');
+                    }
+                    left = questions.filter(q => !hasUserAnswer(q));
+                }
                 // 分流优先采用**服务端行为证据**（gradedKindOf），标签只作兜底：
                 // 有返回时以 answerStatus 为准，避免站点标签不准导致白调 AI 或白轮询。
                 const kindMap = buildAnswerMap(currentResp);
@@ -2600,18 +4545,28 @@ function __TSH_NEW_ENGINE__() {
                     }
                 }
 
-                // 站点前端有硬门禁：未答完提交会被拦下（请完成所有习题后再提交）。
+                // 注：原注释称"站点前端有硬门禁：未答完提交会被拦下"——实测不成立，
+                // 见下方 local5 的说明。此处不再假设门禁存在。
                 if (left.length) {
-                    // 【自动刷课时不能停】有些题本就无法自动作答 —— 典型是语音题（oral_*）：
-                    // 它走第三方语音评测（讯飞），需要真实音频，空提交直接 500。
-                    // 若在这里 stopRun，整个自动刷课就会卡在第一节语音题上。
-                    // 交给 loop 尾部的 autoAdvance 继续：它会把当前 contentId 记入 done，
-                    // 于是不会反复回到这里，而是跳到下一节。
-                    if ((getAutoRun() || {}).active) {
-                        status('本节 ' + left.length + ' 题无法自动作答（语音题需真人录音），跳过并继续下一节');
+                    // 【本地修复 v2.3.1-local73】先尝试提交已作答部分。
+                    // 站点前端没有"整节答完才能提交"的硬门禁（全量产物里无相关文案），
+                    // 且 submitAnswers() 在按钮 disabled 时会直接走提交接口。
+                    // 只有服务端确实拒绝时，才按原逻辑跳过/停止。
+                    const kinds = left.map(q => q.type || '未知').slice(0, 6).join(' / ');
+                    status('本节仍有 ' + left.length + ' 题未能作答（' + kinds + '），尝试提交已作答部分');
+                    log('未作答题目', left.map(q => ({ id: q.id, type: q.type })));
+                    const partialOk = await submitAnswers();
+                    if (partialOk) {
+                        noProgressRounds = 0;
                         return;
                     }
-                    stopRun('仍有 ' + left.length + ' 题无法作答，已停止以免空提交。');
+                    // 【自动刷课时不能停】真正的语音题走第三方评测，空提交会失败。
+                    // 交给 loop 尾部的 autoAdvance 继续，避免卡死在同一节。
+                    if ((getAutoRun() || {}).active) {
+                        status('提交被服务端拒绝，跳过并继续下一节');
+                        return;
+                    }
+                    stopRun('仍有 ' + left.length + ' 题无法作答且提交被拒，已停止。');
                     return;
                 }
 
@@ -2634,6 +4589,49 @@ function __TSH_NEW_ENGINE__() {
                 return !!a.answer;                 // 答错 且 有官方答案 → 可覆盖
             });
 
+            // 【local68】判断题专项必须在 redoList 分支**之前**：
+            // 判断题答错且服务端已下发答案时，会先被 redoList 吃掉，专用路径永远不触发。
+            // 优先用服务端标准答案；没有答案才取反（对⇄错 只有两种可能）。
+            const JUDGE_T = [TYPE.JUDGE, TYPE.JUDGE_HIGH];
+            const judgeWrongAll = questions.filter(q => {
+                if (JUDGE_T.indexOf(q.type) < 0) return false;
+                const a = doneMap.get(Number(q.id));
+                const st = a ? Number(a.status) : Number(q.answerStatus);
+                return st === 2;
+            });
+            if (judgeWrongAll.length) {
+                status('判断题答错 ' + judgeWrongAll.length + ' 题，直接纠正后提交一次');
+                if (await ensureEditableState()) {
+                    const items1 = getExerciseItems();
+                    let fixed = 0;
+                    for (const q of judgeWrongAll) {
+                        const a = doneMap.get(Number(q.id));
+                        const card = findCardForQuestion(items1, q, 0);
+                        if (!card) continue;
+                        let done = false;
+                        if (a && a.answer) {
+                            const val = decodeAnswer(a.answer, q.type);
+                            done = await fillSingleChoice(card, val);
+                            if (!done) done = applyAnswer(card, q.type, val);
+                            if (done) markAnswered(q, val, card);
+                            log('判断题按标准答案纠正', { id: q.id, val: String(val).slice(0, 12), ok: done });
+                        }
+                        if (!done) done = await flipJudgeAnswer(card, q);
+                        if (done) fixed++;
+                    }
+                    if (fixed) {
+                        await sleep(rnd(400, 800));
+                        await submitAnswers();
+                        await verifyAfterSubmit(judgeWrongAll);
+                        noProgressRounds = 0;
+                        return;
+                    }
+                    status('判断题纠正失败，回退到通用流程');
+                } else {
+                    status('判断题纠正前无法进入作答态，回退到通用流程');
+                }
+            }
+
             if (redoList.length) {
                 status('本节有 ' + redoList.length + ' 题答错且服务端已下发标准答案，重做覆盖');
                 if (await ensureEditableState()) {
@@ -2642,6 +4640,28 @@ function __TSH_NEW_ENGINE__() {
                     if (rr.filled) {
                         await sleep(rnd(400, 800));
                         await submitAnswers();
+                        await verifyAfterSubmit(redoList);
+                        noProgressRounds = 0;
+                        return;
+                    }
+                    // 【local55】UI 填不进去（自绘 checkbox 等）→ 把标准答案直接写进
+                    // 提交模型，走接口提交。答案本身是服务端下发的，不依赖页面点击。
+                    let marked = 0;
+                    for (const q of redoList) {
+                        const a = lastAnswerMap.get(Number(q.id));
+                        if (!a || a.answer === undefined || a.answer === '') continue;
+                        const type = q.type || '';
+                        const val = (AI_FILL_TYPES.has(type) || AI_ESSAY_TYPES.has(type))
+                            ? normalizeFillAnswer(a.answer) : decodeAnswer(a.answer, type);
+                        if (val === null || val === undefined || val === '') continue;
+                        markAnswered(q, val, findCardForQuestion(getExerciseItems(), q, 0));
+                        marked++;
+                    }
+                    if (marked) {
+                        status('UI 回填失败，改用接口提交 ' + marked + ' 题标准答案');
+                        log('接口直提', { marked: marked, types: redoList.map(q => q.type) });
+                        await submitAnswers(true);
+                        await verifyAfterSubmit(redoList);
                         noProgressRounds = 0;
                         return;
                     }
@@ -2649,6 +4669,181 @@ function __TSH_NEW_ENGINE__() {
                 } else {
                     status('无法进入作答态，跳过重做');
                 }
+            }
+
+            // 【local22】判错、但服务端还没下发标准答案 —— 这类题最容易被漏掉：
+            // 本节「已全部作答」→ 直接报完成并翻页，页面上那些 -done-wrong 永远不被纠正。
+            // 服务端是在答错累计到 errorNumShow 次后才下发答案的，所以这里主动
+            // 把那几个错误答案再提交几轮，逼出标准答案后回填覆盖。
+            // 自由模式记末次：重复提交**同一个**错误答案不会让成绩更差，
+            // 拿到答案后最后一次提交才是最终成绩，属于单调改善。
+            // 【local23】answerMap 有时是空的：questionAnswerItemVOList[].questionId
+            // 若不是数字，buildAnswerMap 会整条丢掉（Number() → NaN 被跳过），
+            // 于是上面的 filter 恒为空、错题重做永不触发。
+            // 这里同时读「合并后的题目字段」（mergeAnswerItems 已经把 answerStatus /
+            // answer 写到 q 上），两条路都试。
+            const judgeStatusOf = (q, a) => {
+                if (a && a.status !== undefined && a.status !== null && a.status !== '') return Number(a.status);
+                if (q && q.answerStatus !== undefined && q.answerStatus !== null && q.answerStatus !== '') return Number(q.answerStatus);
+                return null;
+            };
+            const hasAnswerOf = (q, a) => {
+                if (a && a.answer) return true;
+                if (q && q.answer) return true;
+                return false;
+            };
+            log('错题判定输入', {
+                questions: questions.length,
+                answerMapSize: doneMap.size,
+                sample: questions.slice(0, 4).map(q => ({
+                    id: q.id,
+                    type: q.type,
+                    doRecord: String(q.doRecord === undefined ? '' : q.doRecord).slice(0, 24),
+                    answerStatus: q.answerStatus,
+                    hasAnswerField: !!q.answer
+                }))
+            });
+            const wrongNoAnswer = questions.filter(q => {
+                const a = doneMap.get(Number(q.id));
+                const st = judgeStatusOf(q, a);
+                if (st === 1) return false;              // 已答对
+                if (st === -1) return false;             // 主观题，服务端不判分
+                if (st === null) return false;           // 状态未知，不动
+                return !hasAnswerOf(q, a);               // 判错 且 没有官方答案
+            });
+            // 【local24】API 字段靠不住时（实测本节的 q.doRecord 是空串、
+            // answerStatus 缺失，answerMap 里又对不上 id），改用**页面上的红叉**判定：
+            // 判错的空会渲染成 span.zty-exercise-item-fill-blank-done-wrong。
+            // 这是用户肉眼能看到的事实，比接口字段可靠。
+            // 【local36】判错标记不能只认填空题的 -done-wrong：
+            // 选择题/判断题答错时站点用别的标记（图标/类名），原来恒为 0，
+            // 于是"答错了"被当成"已完成"直接翻页。
+            let wrongMarks = 0;
+            const wrongDetail = [];
+            try {
+                // 【local47】判错统计必须覆盖**嵌套子卡**：多选题/填空题常常挂在
+                // 组合题父卡内部，只扫顶层卡片会一个标记都数不到 → 判成"已完成"跳过。
+                const scanCards = [];
+                getExerciseItems().forEach(c => {
+                    scanCards.push(c);
+                    try {
+                        c.querySelectorAll('.exercise-item').forEach(x => scanCards.push(x));
+                    } catch (e) {}
+                });
+                scanCards.forEach((card, ci) => {
+                    // 【local37】实测选择题的判错标记是 radio-group-wrong
+                    // （ant-radio-group ant-radio-group-outline radio-group-wrong …）。
+                    // 枚举类名永远漏，改用通配 "wrong"。
+                    const hits = card.querySelectorAll(
+                        '[class*="wrong"], img[src*="wrong"], img[src*="error"], [class*="incorrect"]'
+                    );
+                    if (hits.length) {
+                        wrongMarks += hits.length;
+                        wrongDetail.push({
+                            card: ci,
+                            n: hits.length,
+                            cls: String(card.className || '').slice(0, 40),
+                            sample: String(hits[0].className || hits[0].getAttribute('src') || '').slice(0, 40)
+                        });
+                    }
+                });
+            } catch (e) {}
+            if (wrongMarks > 0 && !wrongNoAnswer.length) {
+                log('页面存在判错标记', { wrongMarks, questions: questions.length, wrongDetail });
+                const th2 = answerRevealThreshold(policy);
+                if (Number.isFinite(th2)) {
+                    status('页面有 ' + wrongMarks + ' 个判错的空，重做以触发答案下发');
+                    if (await ensureEditableState()) {
+                        const gotMark = await retryUntilAnswer(route, questions, th2, true);
+                        if (gotMark) {
+                            status('错题重做期间已取得标准答案并回填');
+                            noProgressRounds = 0;
+                            wrongRedoFails = 0;
+                            return;
+                        }
+                        status('错题重做未取得标准答案，保持原状');
+                        wrongRedoFails++;
+                    } else {
+                        status('无法进入作答态（重做按钮不可用），跳过');
+                        wrongRedoFails++;
+                    }
+                    if (wrongRedoFails >= 4) {
+                        wrongRedoFails = 0;
+                        log('本节错题重做 4 次仍未取得答案，放弃并推进', { wrongMarks });
+                    }
+                } else {
+                    status('课程未提供答错阈值，跳过错题重做');
+                }
+            }
+
+            // 【local67】判断题专项：只有对/错两种可能，答错 → 取反提交一次即可，
+            // 不必等 errorNumShow 轮试错。
+            const JUDGE_TYPES = [TYPE.JUDGE, TYPE.JUDGE_HIGH];
+            const judgeWrong = wrongNoAnswer.filter(q => JUDGE_TYPES.indexOf(q.type) >= 0);
+            if (judgeWrong.length && judgeWrong.length === wrongNoAnswer.length) {
+                status('判断题答错 ' + judgeWrong.length + ' 题，取反后提交一次');
+                const items0 = getExerciseItems();
+                let flipped = 0;
+                for (const q of judgeWrong) {
+                    const card = findCardForQuestion(items0, q, 0);
+                    if (!card) continue;
+                    if (await flipJudgeAnswer(card, q)) flipped++;
+                }
+                if (flipped) {
+                    log('判断题取反完成', { flipped: flipped });
+                    await sleep(rnd(400, 800));
+                    await submitAnswers();
+                    await verifyAfterSubmit(judgeWrong);
+                    noProgressRounds = 0;
+                    return;
+                }
+                status('判断题取反失败，回退到通用流程');
+            }
+
+            if (wrongNoAnswer.length) {
+                const th = answerRevealThreshold(policy);
+                log('判错但无标准答案的题', wrongNoAnswer.map(q => ({ id: q.id, type: q.type })));
+                if (Number.isFinite(th)) {
+                    status('本节有 ' + wrongNoAnswer.length + ' 题判错且无标准答案，重做以触发答案下发');
+                    const gotWrong = await retryUntilAnswer(route, questions, th);
+                    if (gotWrong) {
+                        status('错题重做期间已取得标准答案并回填');
+                        noProgressRounds = 0;
+                        return;
+                    }
+                    status('错题重做未取得标准答案，保持原状');
+                } else {
+                    status('课程未提供答错阈值，跳过错题重做');
+                }
+            }
+
+            // 【local39】服务端已经下发标准答案（含 textarea 问答题，answerStatus=-1 也算），
+            // 但页面还没判对 —— 先回填并提交，不要直接宣布完成翻页。
+            try {
+                const fixedN = await fillFromStandardAnswers(questions);
+                if (fixedN > 0) {
+                    status('已按服务端标准答案回填 ' + fixedN + ' 题，提交');
+                    log('按标准答案回填', { filled: fixedN });
+                    await submitAnswers();
+                    noProgressRounds = 0;
+                    return;
+                }
+            } catch (e) { log('按标准答案回填异常', e); }
+
+            // 【本地修复 local7】宣布"已作答完成"之前，先核对是不是只有本地占位。
+            // 之前占位写进 currentResp 后 hasUserAnswer() 就返回 true，脚本据此
+            // 直接报完成并翻页，而页面按钮还停在"提交"——服务端其实没记录。
+            const localOnly = questions.filter(q => PLACEHOLDER_IDS.has(Number(q.id)));
+            if (localOnly.length) {
+                status('有 ' + localOnly.length + ' 题只有本地占位、服务端未记录作答，重新作答');
+                log('本地占位未落地', localOnly.map(q => ({ id: q.id, type: q.type })));
+                PLACEHOLDER_IDS.clear();
+                noProgressRounds++;
+                if (noProgressRounds >= 3) {
+                    noProgressRounds = 0;
+                    stopRun('提交未被服务端接受（' + localOnly.length + ' 题无记录），已停止');
+                }
+                return;
             }
 
             status('本节已作答完成（成绩记' + strat.gradeBy + '），推进下一节');
@@ -2997,7 +5192,8 @@ function __TSH_NEW_ENGINE__() {
             const b = $1('#b6-start');
             if (b) b.textContent = '停止';
             running = true; roundCount = 0; noProgressRounds = 0; invalidRounds = 0;
-            status('自动刷课：已恢复运行（已处理 ' + ((st.done || []).length) + ' 项）');
+            status('自动刷课：已恢复运行（已处理 ' + ((st.done || []).length) + ' 项，第 '
+                + ((st.jumps || 0) + 1) + ' 次跳转；点「停止」可中断，页面自动刷新即由此产生）');
             loop();
         }, 2200);
     })();
@@ -3062,7 +5258,7 @@ function __TSH_OLD_ENGINE__() {
 
     // ================= 脚本有效性检测 + GitHub Issue 上报 =================
     // 用途：开源托管时，若网站改版导致脚本失效，自动向 GitHub 发 issue（需用户同意；24h 去重防刷）
-    const SCRIPT_VERSION = '2.3.0'; // 与 @version 保持一致
+    const SCRIPT_VERSION = '2.3.1-local73'; // 与 @version 保持一致
     const REPORT_KEY = 'tsh_auto_brush_report';
     let reportConfig = { consent: null, consentVersion: '', enabled: false, owner: '', repo: '', token: '', lastReport: 0 };
     function loadReportConfig() {
@@ -4486,19 +6682,19 @@ function __TSH_OLD_ENGINE__() {
 
     // 供排错使用：在 Console 里执行 window.__TSH_BRUSH__ 可查看状态
     globalThis.__TSH_BRUSH__ = {
-        version: '2.3.0',
+        version: '2.3.1-local73',
         engine: isNewSite ? 'new' : (isLegacySite ? 'legacy' : 'idle'),
         path: path
     };
 
     if (isNewSite) {
-        try { console.log('[刷课] 检测到新版站点，启动新版引擎 v2.3.0'); } catch (e) {}
+        try { console.log('[刷课] 检测到新版站点，启动新版引擎 v2.3.1-local73（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
         __TSH_NEW_ENGINE__();
         return;
     }
 
     if (isLegacySite) {
-        try { console.log('[刷课] 检测到旧站 /legacy/，启动旧站引擎 v2.3.0'); } catch (e) {}
+        try { console.log('[刷课] 检测到旧站 /legacy/，启动旧站引擎 v2.3.1-local73（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
         __TSH_OLD_ENGINE__();
         return;
     }
