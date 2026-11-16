@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         TSH自动刷课
-// @version      2.3.1-local78
+// @version      2.3.1-local82
 // @namespace    wasd258-jpg.tsh-autobrush
 // @description  清华社英语在线自动刷课（双引擎版）。自动识别站点版本：新版 /course_center/ 与旧站 /legacy/ 均支持，装一次即可。功能：自动答题+章节推进+查成绩+学习时长保活。新版支持单选/多选/判断/填空/下拉/拖拽；语音题需真人录音。含结构自检。
 // @author       WASD258-jpg
@@ -44,7 +44,7 @@ function __TSH_NEW_ENGINE__() {
 
     'use strict';
 
-    const SCRIPT_VERSION = '2.3.1-local78'; // 与 @version 保持一致
+    const SCRIPT_VERSION = '2.3.1-local82'; // 与 @version 保持一致
 
     // ============================================================================
     // 1. 新站契约常量（逆向自线上产物，构建版本 20260930165203）
@@ -640,7 +640,7 @@ function __TSH_NEW_ENGINE__() {
 
     // 可作答控件：任意一种命中，说明这张卡能靠填 DOM 完成，不应按语音题跳过。
     //
-    // 【本地修复 v2.3.1-local78】判据最终收敛为两条：
+    // 【本地修复 v2.3.1-local82】判据最终收敛为两条：
     //   v2.3.0   卡片深处出现语音类名就判语音题（后代查询 → 误判填空题）
     //   local1   加"可填控件优先"+"标记须在自身包装层"，仍漏：听力填空题的
     //            空位是基础类 fill-blank / antd 下拉，未聚焦时不含 -do 与 contenteditable
@@ -2358,8 +2358,31 @@ function __TSH_NEW_ENGINE__() {
                         inputs.forEach((inp, i) => { if (arr[i] !== undefined) fillInput(inp, String(arr[i])); });
                         return true;
                     }
-                    const arr = Array.isArray(value) ? value
-                        : (value && typeof value === 'object' ? Object.values(value) : String(value).split('|'));
+                    // 【local82】分隔符语义（实测确认）：
+                    //   '|'  → 多个空之间（一个空一个值）
+                    //   '/'  → **同一个空**的多个可接受答案（候选），填第一个即可
+                    // 之前把 '/' 也当"空之间"分隔，导致 2 空 2 候选被错位填成两句。
+                    let arr;
+                    if (Array.isArray(value)) arr = value;
+                    else if (value && typeof value === 'object') arr = Object.values(value);
+                    else {
+                        const str = String(value == null ? '' : value);
+                        if (str.indexOf('|') >= 0) {
+                            arr = str.split('|');
+                        } else {
+                            const cands = str.split(/\s*\/\s*/).map(x => x.trim()).filter(Boolean);
+                            arr = [cands[0] || str.trim()];
+                            if (cands.length > 1) {
+                                log('答案候选', { n: cands.length, pick: cands[0], all: cands.slice(0, 4) });
+                            }
+                        }
+                    }
+                    arr = arr.map(x => String(x == null ? '' : x).trim());
+                    log('填空写入', {
+                        blanks: blanks.length,
+                        parts: arr.length,
+                        preview: arr.slice(0, 4).map(x => x.slice(0, 18))
+                    });
                     blanks.forEach((b, i) => { if (arr[i] !== undefined) fillEditable(b, String(arr[i])); });
                     return true;
                 }
@@ -2864,7 +2887,7 @@ function __TSH_NEW_ENGINE__() {
                 if (!opts.length) return false;
                 return selectOption(opts[0]);
             }
-            // 【本地修复 v2.3.1-local78】judge_advanced（多小题判断）原来没有占位分支：
+            // 【本地修复 v2.3.1-local82】judge_advanced（多小题判断）原来没有占位分支：
             // fillPlaceholder 落到最后的 return false，于是 retryUntilAnswer 第 1819 行
             // 「仍有无法写入的题」直接 return，一次提交都不发 → 服务端永远累计不到
             // 答错次数 → 拿不到标准答案 → 该题最终报「未能作答（judge_advanced）」。
@@ -3371,6 +3394,12 @@ function __TSH_NEW_ENGINE__() {
             const clsDisabled = String(el.className || '').indexOf('disabled') >= 0;
             if (clsDisabled && (!inp || inp.disabled)) continue;
             if (inp && inp.disabled) continue;
+            // 【local80】查看态的 contenteditable 不算可写：
+            // -done 的填空 span 也带 contenteditable="true"，会让"是否在作答态"恒为真，
+            // 于是永不点 Retry，占位永远写不进去。
+            try {
+                if (el.closest && el.closest('.zty-exercise-item-fill-blank-done, [class*="readonly-answer"], .answer-card-course, [class*="done-wrong"], [class*="done-right"]')) continue;
+            } catch (e) {}
             return el;
         }
         return null;
@@ -3591,7 +3620,19 @@ function __TSH_NEW_ENGINE__() {
                 // 【local78】再加一条：服务端说已作答、但卡片里**一个字都没有**时，
                 // 也要强制重写（否则占位填不进、直接空提交，答错次数永远不涨）。
                 const cardNow = findCardForQuestion(items, q, i);
-                const domHas = cardHasContent(cardNow);
+                // 【local80】只有"卡片当前可写"且"确实有内容"才算已作答。
+                // 查看态（-done / readonly-answer）里也有文字，但那不是可写的作答，
+                // 必须重写才能让服务端累计答错次数。
+                let editableCard = false;
+                try {
+                    editableCard = !!(cardNow && cardNow.querySelector(
+                        '.zty-exercise-item-fill-blank-do, textarea:not([disabled]), ' +
+                        'input[type="text"]:not([disabled]):not([readonly]), ' +
+                        '.ant-radio-wrapper:not(.ant-radio-wrapper-disabled), ' +
+                        '.ant-checkbox-wrapper:not(.ant-checkbox-wrapper-disabled)'
+                    ));
+                } catch (e) {}
+                const domHas = editableCard && cardHasContent(cardNow);
                 if (hasUserAnswer(q) && !forceRewrite && domHas) { wroteAny++; continue; }
                 if (hasUserAnswer(q) && !domHas) {
                     log('服务端说已作答但页面无内容，强制重写', { id: q.id, type: q.type });
@@ -4482,7 +4523,7 @@ function __TSH_NEW_ENGINE__() {
         if (questions.length) {
             // 语音评测题需真实录音，无法自动作答 —— 但不因此跳过整节。
             //
-            // 【本地修复 v2.3.1-local78】站点并没有"整节答完才能提交"的硬门禁：
+            // 【本地修复 v2.3.1-local82】站点并没有"整节答完才能提交"的硬门禁：
             // 全量前端产物里搜不到「请完成所有习题」这类文案（0 命中），
             // 而 submitAnswers() 在按钮 disabled 时会直接调提交接口，
             // 也就是说部分作答是可以提交的。因此只在这两种情况下跳过：
@@ -4645,7 +4686,7 @@ function __TSH_NEW_ENGINE__() {
                 // 注：原注释称"站点前端有硬门禁：未答完提交会被拦下"——实测不成立，
                 // 见下方 local5 的说明。此处不再假设门禁存在。
                 if (left.length) {
-                    // 【本地修复 v2.3.1-local78】先尝试提交已作答部分。
+                    // 【本地修复 v2.3.1-local82】先尝试提交已作答部分。
                     // 站点前端没有"整节答完才能提交"的硬门禁（全量产物里无相关文案），
                     // 且 submitAnswers() 在按钮 disabled 时会直接走提交接口。
                     // 只有服务端确实拒绝时，才按原逻辑跳过/停止。
@@ -4942,6 +4983,38 @@ function __TSH_NEW_ENGINE__() {
                 }
                 return;
             }
+
+            // 【local79】服务端已判对（st=1）但页面空着 —— 常见于走接口提交的节。
+            // 这里把标准答案**只回填到页面、不提交**，让显示与成绩一致；
+            // 不提交是因为成绩已经是正确值（自由模式记末次），再提交只会引入风险。
+            try {
+                const emptyButRight = questions.filter(q => {
+                    const a = doneMap.get(Number(q.id));
+                    if (!a || Number(a.status) !== 1 || !a.answer) return false;
+                    const card = findCardForQuestion(getExerciseItems(), q, 0);
+                    return card && !cardHasContent(card);
+                });
+                if (emptyButRight.length) {
+                    log('已判对但页面为空，回填展示', emptyButRight.map(q => ({ id: q.id, type: q.type })));
+                    if (await ensureEditableState()) {
+                        let shown = 0;
+                        for (const q of emptyButRight) {
+                            const a = doneMap.get(Number(q.id));
+                            const card = findCardForQuestion(getExerciseItems(), q, 0);
+                            if (!card) continue;
+                            const type = q.type || '';
+                            const val = (AI_FILL_TYPES.has(type) || AI_ESSAY_TYPES.has(type))
+                                ? normalizeFillAnswer(a.answer) : decodeAnswer(a.answer, type);
+                            if (val === null || val === undefined) continue;
+                            const okFill = type === TYPE.MULTIPLE
+                                ? await fillMultipleChoice(card, val)
+                                : (type === TYPE.SINGLE ? await fillSingleChoice(card, val) : applyAnswer(card, type, val));
+                            if (okFill) shown++;
+                        }
+                        log('展示回填完成', { shown: shown, submit: false });
+                    }
+                }
+            } catch (e) { log('展示回填异常', String(e).slice(0, 60)); }
 
             status('本节已作答完成（成绩记' + strat.gradeBy + '），推进下一节');
             noProgressRounds = 0;
@@ -5355,7 +5428,7 @@ function __TSH_OLD_ENGINE__() {
 
     // ================= 脚本有效性检测 + GitHub Issue 上报 =================
     // 用途：开源托管时，若网站改版导致脚本失效，自动向 GitHub 发 issue（需用户同意；24h 去重防刷）
-    const SCRIPT_VERSION = '2.3.1-local78'; // 与 @version 保持一致
+    const SCRIPT_VERSION = '2.3.1-local82'; // 与 @version 保持一致
     const REPORT_KEY = 'tsh_auto_brush_report';
     let reportConfig = { consent: null, consentVersion: '', enabled: false, owner: '', repo: '', token: '', lastReport: 0 };
     function loadReportConfig() {
@@ -6779,19 +6852,19 @@ function __TSH_OLD_ENGINE__() {
 
     // 供排错使用：在 Console 里执行 window.__TSH_BRUSH__ 可查看状态
     globalThis.__TSH_BRUSH__ = {
-        version: '2.3.1-local78',
+        version: '2.3.1-local82',
         engine: isNewSite ? 'new' : (isLegacySite ? 'legacy' : 'idle'),
         path: path
     };
 
     if (isNewSite) {
-        try { console.log('[刷课] 检测到新版站点，启动新版引擎 v2.3.1-local78（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
+        try { console.log('[刷课] 检测到新版站点，启动新版引擎 v2.3.1-local82（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
         __TSH_NEW_ENGINE__();
         return;
     }
 
     if (isLegacySite) {
-        try { console.log('[刷课] 检测到旧站 /legacy/，启动旧站引擎 v2.3.1-local78（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
+        try { console.log('[刷课] 检测到旧站 /legacy/，启动旧站引擎 v2.3.1-local82（完整日志在本控制台，筛选 [刷课]）'); } catch (e) {}
         __TSH_OLD_ENGINE__();
         return;
     }

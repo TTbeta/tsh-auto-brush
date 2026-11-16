@@ -229,3 +229,26 @@ payload = { catalogId, contentId, questionItemList: fe(o.value, new Map(l.value.
 - 只信 `getBoundingClientRect` → 虚拟滚动时真实卡片被判不可见（#23）
 
 判据速查表（第四节）里每一条都是"两边对账"的产物。
+
+---
+
+## 九、local79–local82：页面显示、作答态与候选答案
+
+| # | 现象 | 根因 | 版本 |
+|---|---|---|---|
+| 41 | 已判对但页面空着，像"跳过" | 接口提交成功（`st:1`）但 UI 没刷新 | local79（只回填展示、不提交，避免改成绩） |
+| 42 | 试错时又不填空 | 查看态 `-done` 的 span 带 `contenteditable="true"`，被当成"可写控件"和"已有内容"，两处误判叠加 → 永不点 Retry、占位写不进 | local80 |
+| 43 | 答案 `a/b` 形态只填一个 | 分隔符语义搞错：`/` 是**同一个空的候选答案**，不是多个空 | local82（取第一个候选；`\|` 才是多空分隔） |
+
+### 分隔符语义（实测确认）
+
+| 形态 | 含义 | 处理 |
+|---|---|---|
+| `isn't studying/is playing basketball` | 同一空的**多个可接受答案** | 取第一个 |
+| `a\|b` | 多个空之间的分隔 | 依次填第 1、2… 个空 |
+
+### 又一次"两套状态"问题
+
+`firstEditableControl()` 与 `cardHasContent()` 都栽在同一件事上：**查看态的 DOM 长得像作答态**。
+`-done` 的填空 span 既有文字、又带 `contenteditable="true"`，于是"能写"和"已写"两个判断同时为真，
+结果什么都不做就提交。现在的判据是：元素必须**不在** `-done` / `readonly-answer` / `answer-card-course` 之内。
