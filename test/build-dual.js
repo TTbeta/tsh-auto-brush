@@ -20,7 +20,32 @@
 const fs = require('fs');
 const path = require('path');
 
-const REPO = path.resolve(__dirname, '..', '..', 'tsh-auto-brush');
+// ⚠️ 本仓库的 tsh-auto-brush.user.js 是**手工维护的产物**（2.3.1-local73），
+//    内含 35 处针对线上站点的实测修复，这些修复**只存在于产物里**，engines/ 是原版。
+//    因此默认拒绝构建，避免一次误跑把修复全部覆盖。
+//    确实要重建：node test/build-dual.js --force（会丢掉产物里的全部本地修复）
+if (!process.argv.includes('--force')) {
+    console.error([
+        '',
+        '════════════════════════════════════════════════════════════',
+        '  已阻止构建：tsh-auto-brush.user.js 是手工维护的产物',
+        '',
+        '  该文件内含 35 处实测修复（见 CHANGELOG-local.md），',
+        '  而 engines/ 仍是上游原版 —— 构建会把这些修复全部覆盖。',
+        '',
+        '  确实需要重建请显式加参数：',
+        '      node test/build-dual.js --force',
+        '════════════════════════════════════════════════════════════',
+        ''
+    ].join(String.fromCharCode(10)));
+    process.exit(1);
+}
+
+// 产物写入本仓库根目录；上游原版把仓库放在同名目录下，这里做兼容回退
+const REPO_LOCAL = path.resolve(__dirname, '..');
+const REPO = fs.existsSync(path.join(REPO_LOCAL, 'engines'))
+    ? REPO_LOCAL
+    : path.resolve(__dirname, '..', '..', 'tsh-auto-brush');
 const OUT = path.join(REPO, 'tsh-auto-brush.user.js');
 const ENGINES = path.join(REPO, 'engines');
 
